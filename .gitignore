@@ -1,0 +1,21 @@
+# Data cache
+~/.cache/autoresearch/
+
+# Auto-generated
+*.pyc
+__pycache__/
+*.egg-info/
+.venv/
+
+# Results (regenerated)
+results/
+plots/
+logs/
+run.log
+knowledge.json
+state.json
+report.md
+
+# OS files
+.DS_Store
+*.swp
