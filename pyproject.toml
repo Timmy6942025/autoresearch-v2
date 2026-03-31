@@ -1,27 +1,31 @@
 [project]
 name = "autoresearch"
-version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+version = "0.2.0"
+description = "Autonomous pretraining research system — MLX/Apple Silicon edition"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
+    # ─── Core: MLX for Apple Silicon GPU training ────────
+    "mlx>=0.20.0",
+    # ─── TurboQuant-MLX: KV cache compression for eval ───
+    # 5.6× KV cache compression (92 bytes/tok vs 512 bytes fp16)
+    # Install from GitHub — not yet on PyPI
+    "turboquant-mlx",
+    # ─── Data pipeline ───────────────────────────────────
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "pyarrow>=21.0.0",
+    "pandas>=2.3.3",
+    "numpy>=2.2.6",
+    # ─── Visualization & reporting ───────────────────────
+    "matplotlib>=3.10.8",
+    "requests>=2.32.0",
 ]
 
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
+[[tool.uv.sources]]
+turboquant-mlx = { git = "https://github.com/sharpner/turboquant-mlx.git" }
 
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+[project.optional-dependencies]
+# PyTorch kept for comparison/benchmarking only
+pytorch = ["torch==2.9.1", "kernels>=0.11.7"]
+dev     = ["pytest", "black", "mypy"]

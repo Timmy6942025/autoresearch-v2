@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """
-Autoresearch v2 — Recursive Self-Improving ML Research System
+Autoresearch v2: Recursive Self-Improving ML Research System.
 
-Master entry point that orchestrates all research components:
-  - knowledge_base.py     (persistent memory across sessions)
-  - research_orchestrator.py  (strategic experiment management)
-  - experiment_designer.py    (systematic plan generation)
-  - meta_analyzer.py          (pattern discovery from results)
-  - dashboard.py              (visual analytics)
-  - self_improve.py           (recursive process improvement)
+Master entry point that orchestrates the full research loop:
+  1. Initialize / load knowledge base
+  2. Get next experiment from orchestrator / experiment_designer
+  3. Apply changes to train.py (read / modify / write)
+  4. Run `uv run train.py` or `uv run train_mlx.py` with timeout
+  5. Parse val_bpb and metrics from run output
+  6. Record result in knowledge base + results.tsv
+  7. Every N experiments: run meta_analyzer + dashboard
+  8. Every M experiments: run self_improve
+  9. Checkpoint state for crash recovery
+
+Modes:
+  baseline  - Run a single baseline experiment
+  single    - Run N experiments (sequential)
+  night     - ~100 experiments (overnight run)
+  deep      - With meta-analysis cycles
+  recursive - Full self-improving loop
+
+Engines:
+  pytorch   - CPU/CUDA via PyTorch (train.py)
+  mlx       - Apple Silicon GPU via MLX (train_mlx.py)
 
 Usage:
-    # Quick modes
-    python launch.py --mode baseline           # Single baseline run
-    python launch.py --mode single -n 10       # Run N experiments
-    python launch.py --mode night              # ~100 experiments (overnight)
-    python launch.py --mode deep               # With meta-analysis every 20
-    python launch.py --mode recursive          # Full self-improving loop
-
-    # Advanced
-    python launch.py --mode single -n 50 --branch autoresearch/v2-night3
-    python launch.py --mode recursive --max-experiments 200
-    python launch.py --resume                  # Resume from last checkpoint
+  python launch.py --mode baseline
+  python launch.py --mode single -n 10
+  python launch.py --mode night --engine mlx
+  python launch.py --mode deep --engine pytorch
+  python launch.py --mode recursive --engine mlx
 """
 
 from __future__ import annotations
@@ -30,756 +38,1222 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+import traceback
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Paths
+# Constants
 # ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent
-SCRIPTS = ROOT / "scripts"
-RESULTS_DIR = ROOT / "results"
-PLOTS_DIR = ROOT / "plots"
-STATE_FILE = ROOT / "state.json"
 
-# Ensure directories exist
-for d in [RESULTS_DIR, PLOTS_DIR, SCRIPTS]:
-    d.mkdir(parents=True, exist_ok=True)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR
+RESULTS_DIR = PROJECT_ROOT / "results"
+PLOTS_DIR = PROJECT_ROOT / "plots"
+LOGS_DIR = PROJECT_ROOT / "logs"
+STATE_FILE = PROJECT_ROOT / "state.json"
+TSV_FILE = RESULTS_DIR / "results.tsv"
+
+DEFAULT_TRAIN_TIMEOUT = 600  # 10 minutes per experiment
+META_ANALYZER_INTERVAL = 20  # run meta analysis every N experiments
+SELF_IMPROVE_INTERVAL = 50   # run self-improve every N experiments
+DEFAULT_NIGHT_COUNT = 100
+
+# Engine-specific paths and settings
+ENGINE_CONFIG = {
+    "pytorch": {
+        "train_script": "train.py",
+        "target_file": "train.py",
+        "reset_target": "train.py",
+        "output_prefix": "results/",
+    },
+    "mlx": {
+        "train_script": "train_mlx.py",
+        "target_file": "train.py",  # MLX still reads hyperparams from shared config
+        "reset_target": "train.py",
+        "output_prefix": "results/",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-LOGGER = logging.getLogger("autoresearch-v2")
+
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOGS_DIR / "launch.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("launch")
+
+# ---------------------------------------------------------------------------
+# Global engine context (set by main(), read by helpers)
+# ---------------------------------------------------------------------------
+
+_current_engine: str = "pytorch"
 
 
-def setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    fmt = "%(asctime)s  %(levelname)-7s  %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    log_file = ROOT / "logs" / f"run_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    handlers.append(logging.FileHandler(str(log_file)))
-    logging.basicConfig(level=level, format=fmt, handlers=handlers)
-    LOGGER.addHandler(logging.getLogger())
+def get_engine() -> str:
+    """Return the current engine being used."""
+    return _current_engine
+
+
+def get_engine_config(engine: str) -> Dict[str, str]:
+    """Return configuration dict for the given engine."""
+    return ENGINE_CONFIG.get(engine, ENGINE_CONFIG["pytorch"])
 
 
 # ---------------------------------------------------------------------------
-# State management (checkpoint / resume)
+# State checkpoint
 # ---------------------------------------------------------------------------
 
-def load_state() -> dict[str, Any]:
+@dataclass
+class RunState:
+    """Serializable checkpoint for crash recovery."""
+    mode: str = ""
+    experiment_count: int = 0
+    experiments_completed: int = 0
+    experiments_failed: int = 0
+    start_time: str = ""
+    last_experiment_id: str = ""
+    last_val_bpb: Optional[float] = None
+    best_val_bpb: Optional[float] = None
+    best_experiment_id: str = ""
+    interrupted: bool = False
+    pending_experiments: List[Dict[str, Any]] = field(default_factory=list)
+    completed_ids: set = field(default_factory=set)
+    engine: str = "pytorch"
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["completed_ids"] = list(self.completed_ids)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RunState":
+        d = dict(d)
+        d["completed_ids"] = set(d.get("completed_ids", []))
+        return cls(**d)
+
+
+def save_state(state: RunState) -> None:
+    """Atomically save state to disk."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state.to_dict(), indent=2, default=str))
+    tmp.rename(STATE_FILE)
+
+
+def load_state() -> Optional[RunState]:
+    """Load saved state if it exists."""
     if STATE_FILE.exists():
         try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return _default_state()
+            return RunState.from_dict(json.loads(STATE_FILE.read_text()))
+        except Exception as e:
+            logger.warning(f"Failed to load state file: {e}")
+    return None
 
 
-def save_state(state: dict[str, Any]) -> None:
-    state["last_updated"] = datetime.now(timezone.utc).isoformat()
-    tmp = str(STATE_FILE) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2, default=str)
-    os.replace(tmp, str(STATE_FILE))
+# ---------------------------------------------------------------------------
+# TSV results writer
+# ---------------------------------------------------------------------------
+
+_TSV_HEADER = (
+    "experiment_id\texperiment_name\tval_bpb\tdelta\tphase\tstatus\t"
+    "timestamp\tduration\tchanges\tnotes\tengine"
+)
 
 
-def _default_state() -> dict[str, Any]:
-    return {
-        "mode": None,
-        "branch": None,
-        "experiment_count": 0,
-        "best_val_bpb": None,
-        "best_config": None,
-        "phase": 1,
-        "last_meta_analysis_at": 0,
-        "last_self_improve_at": 0,
-        "status": "idle",
-        "started_at": None,
-    }
+def _ensure_tsv_header() -> bool:
+    """Ensure the TSV file has a header. Returns True if file was created."""
+    if not TSV_FILE.exists() or TSV_FILE.stat().st_size == 0:
+        TSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TSV_FILE.write_text(_TSV_HEADER + "\n", encoding="utf-8")
+        return True
+    # If old header without engine column, check
+    first_line = TSV_FILE.open(encoding="utf-8").readline().strip()
+    if "engine" not in first_line:
+        return True  # will be handled by append
+    return False
+
+
+def append_tsv(
+    experiment_id: str,
+    experiment_name: str,
+    val_bpb: Optional[float],
+    delta: Optional[float],
+    phase: int,
+    status: str,
+    duration: float,
+    changes: str,
+    notes: str = "",
+    engine: str = "pytorch",
+) -> None:
+    """Append a row to results.tsv."""
+    _ensure_tsv_header()
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    bpb_str = f"{val_bpb:.6f}" if val_bpb is not None else "N/A"
+    delta_str = f"{delta:+.6f}" if delta is not None else "N/A"
+    with open(TSV_FILE, "a", encoding="utf-8") as f:
+        f.write(
+            f"{experiment_id}\t{experiment_name}\t{bpb_str}\t{delta_str}\t"
+            f"{phase}\t{status}\t{ts}\t{duration:.1f}\t{changes}\t{notes}\t{engine}\n"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
 
-def run_git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        capture_output=True, text=True,
-        cwd=ROOT, check=check,
-    )
-
-
-def ensure_branch(branch: str) -> None:
-    """Create or check out the research branch."""
+def git_commit(message: str) -> Optional[str]:
+    """Stage changes and commit. Returns commit hash or None on failure."""
     try:
-        run_git("checkout", branch)
-        LOGGER.info("Already on branch %s", branch)
-    except subprocess.CalledProcessError:
-        run_git("checkout", "-b", branch)
-        LOGGER.info("Created new branch %s", branch)
-
-
-def commit_changes(message: str) -> str | None:
-    """Stage train.py changes and commit. Returns short hash or None."""
-    run_git("add", "train.py")
-    result = run_git("diff", "--staged", "--quiet", check=False)
-    if result.returncode == 0:
-        LOGGER.warning("No changes to commit (diff is empty)")
-        return None
-    run_git("commit", "-m", message)
-    short = run_git("rev-parse", "--short=7", "HEAD").stdout.strip()
-    LOGGER.info("Committed: [%s] %s", short, message)
-    return short
-
-
-def reset_to_commit(h: str) -> None:
-    """Hard reset to a known-good commit."""
-    run_git("reset", "--hard", h)
-    LOGGER.info("Reset to %s", h)
-
-
-def get_current_commit() -> str:
-    r = run_git("rev-parse", "--short=7", "HEAD")
-    return r.stdout.strip()
-
-
-# ---------------------------------------------------------------------------
-# Training runner
-# ---------------------------------------------------------------------------
-
-def run_training(timeout: int = 620) -> dict[str, Any] | None:
-    """
-    Run uv run train.py with timeout.
-    Returns parsed metrics dict on success, None on failure/timeout.
-    """
-    logf = ROOT / "run.log"
-    env = os.environ.copy()
-    start = time.monotonic()
-
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "uv", "run", "train.py"],
-            capture_output=True, text=True,
-            timeout=timeout,
-            cwd=ROOT,
-            env=env,
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        logf.write_text(proc.stdout + proc.stderr)
-        LOGGER.debug("Training exit code: %s (%.1fs)", proc.returncode, time.monotonic() - start)
-
-        if proc.returncode != 0:
-            LOGGER.warning("Training failed (rc=%d). Last 30 lines:", proc.returncode)
-            for line in (proc.stdout + proc.stderr).splitlines()[-30:]:
-                LOGGER.warning("  %s", line)
-            return None
-
-    except subprocess.TimeoutExpired:
-        LOGGER.warning("Training timed out after %ds", timeout)
-        return None
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            hash_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return hash_result.stdout.strip()
     except Exception as e:
-        LOGGER.error("Training crash: %s", e)
+        logger.debug(f"Git commit failed: {e}")
+    return None
+
+
+def git_current_branch() -> str:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def git_reset_train(engine: str = "pytorch") -> bool:
+    """Reset the target training script to the last committed version."""
+    config = get_engine_config(engine)
+    target = config.get("reset_target", "train.py")
+    try:
+        subprocess.run(
+            ["git", "checkout", "--", target],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# train.py / train_mlx.py mutation
+# ---------------------------------------------------------------------------
+
+def apply_changes_to_train(changes: Dict[str, Any], engine: str = "pytorch") -> Optional[str]:
+    """
+    Apply parameter changes to the training script by modifying constants.
+    For MLX, edits train.py which shares config with train_mlx.py.
+    Returns a description of changes made, or None on failure.
+    """
+    config = get_engine_config(engine)
+    train_path = PROJECT_ROOT / config.get("target_file", "train.py")
+    if not train_path.exists():
+        logger.error(f"{train_path.name} not found!")
         return None
 
-    # Parse output
-    text = logf.read_text()
-    metrics: dict[str, Any] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("val_bpb:"):
-            try:
-                metrics["val_bpb"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("peak_vram_mb:"):
-            try:
-                metrics["peak_vram_mb"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("training_seconds:"):
-            try:
-                metrics["training_seconds"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("num_steps:"):
-            try:
-                metrics["num_steps"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("depth:"):
-            try:
-                metrics["depth"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
+    content = train_path.read_text()
+    original = content
+    applied = []
 
-    if "val_bpb" in metrics:
-        return metrics
-    LOGGER.warning("Could not parse val_bpb from training output")
+    # Mapping from experiment param names to variable names
+    PARAM_MAP = {
+        "DEPTH": ("n_layer", int),
+        "DIM": ("n_embd", int),
+        "N_HEAD": ("n_head", int),
+        "N_KV_HEAD": ("n_kv_head", int),
+        "HEAD_DIM": ("head_dim", int),
+        "LEARNING_RATE": ("learning_rate", float),
+        "LR": ("learning_rate", float),
+        "WARMUP_PCT": ("warmup_pct", float),
+        "WARMUP_STEPS": ("warmup_steps", int),
+        "WEIGHT_DECAY": ("weight_decay", float),
+        "BATCH_SIZE": ("batch_size", int),
+        "SEQ_LEN": ("sequence_len", int),
+        "GRAD_CLIP": ("clip_grad_norm", float),
+        "CLIP_GRAD_NORM": ("clip_grad_norm", float),
+        "DROPOUT": ("dropout", float),
+        "LABEL_SMOOTHING": ("label_smoothing", float),
+        "MOMENTUM": ("muon_momentum", float),
+        "STOCHASTIC_DEPTH": ("stochastic_depth", float),
+        "WINDOW_PATTERN": ("window_pattern", str),
+        "MLP_TYPE": ("mlp_type", str),
+        "BLOCK_TYPE": ("block_type", str),
+        # MLX-specific aliases
+        "TOTAL_BATCH_SIZE": ("TOTAL_BATCH_SIZE", int),
+        "DEVICE_BATCH_SIZE": ("DEVICE_BATCH_SIZE", int),
+        "TIME_BUDGET": ("TIME_BUDGET", int),
+        "EMBEDDING_LR": ("EMBEDDING_LR", float),
+        "MATRIX_LR": ("MATRIX_LR", float),
+        "SCALAR_LR": ("SCALAR_LR", float),
+        "ADAM_BETAS": ("ADAM_BETAS", str),
+        "MAX_GRAD_NORM": ("MAX_GRAD_NORM", float),
+        "WARMUP_RATIO": ("WARMUP_RATIO", float),
+    }
+
+    for param, value in changes.items():
+        key, dtype = PARAM_MAP.get(param, (None, None))
+        if key is None:
+            logger.warning(f"Unknown param '{param}' - skipping")
+            continue
+
+        if dtype == str:
+            patterns = [
+                rf'^(\s*{re.escape(key)}\s*=\s*)(["\']).*?\2',
+                rf"^(\s*{re.escape(key)}\s*=\s*)\S+",
+            ]
+        else:
+            patterns = [
+                rf"^(\s*{re.escape(key)}\s*=\s*)\S+",
+            ]
+
+        replaced = False
+        for pattern in patterns:
+            match = re.search(pattern, content, re.MULTILINE)
+            if match:
+                if dtype == str:
+                    new_line = f'{match.group(1)}"{value}"'
+                elif dtype == int:
+                    new_line = f"{match.group(1)}{int(value)}"
+                else:
+                    new_line = f"{match.group(1)}{float(value)}"
+                content = content[:match.start()] + new_line + content[match.end():]
+                replaced = True
+                break
+
+        if replaced:
+            applied.append(f"{param}={value}")
+        else:
+            logger.warning(f"Could not find '{key}' in {train_path.name} for param '{param}'")
+
+    if applied:
+        train_path.write_text(content)
+        return ", ".join(applied)
     return None
 
 
 # ---------------------------------------------------------------------------
-# Component runners (shell out to scripts)
+# Training execution
 # ---------------------------------------------------------------------------
 
-def run_script(name: str, args: list[str], capture: bool = False) -> str | None:
-    """Run a script from the scripts/ directory."""
-    script = SCRIPTS / name
-    if not script.exists():
-        LOGGER.error("Script not found: %s", script)
-        return None
-    cmd = [sys.executable, str(script), *args]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=120)
-        out = result.stdout
-        if result.returncode != 0:
-            LOGGER.warning("Script %s failed (rc=%d): %s", name, result.returncode, result.stderr[:300])
-        if capture:
-            return out
-        if out:
-            LOGGER.debug("  %s output: %s", name, out[:200])
-        return out
-    except subprocess.TimeoutExpired:
-        LOGGER.warning("Script %s timed out", name)
-        return None
-    except Exception as e:
-        LOGGER.error("Script %s crashed: %s", name, e)
-        return None
+def parse_pytorch_output(log: str) -> Dict[str, Any]:
+    """Parse PyTorch training output (train.py)."""
+    result = {
+        "val_bpb": None,
+        "metrics": {},
+    }
+    for line in log.splitlines():
+        stripped = line.strip()
+        m_bpb = re.match(r"^val_bpb:\s*([\d.]+)", stripped)
+        if m_bpb:
+            result["val_bpb"] = float(m_bpb.group(1))
+
+        m_sec = re.match(r"^training_seconds:\s*([\d.]+)", stripped)
+        if m_sec:
+            result["metrics"]["training_seconds"] = float(m_sec.group(1))
+
+        m_mfu = re.match(r"^mfu_percent:\s*([\d.]+)", stripped)
+        if m_mfu:
+            result["metrics"]["mfu_percent"] = float(m_mfu.group(1))
+
+        m_tok = re.match(r"^total_tokens_M:\s*([\d.]+)", stripped)
+        if m_tok:
+            result["metrics"]["total_tokens_M"] = float(m_tok.group(1))
+
+        m_steps = re.match(r"^num_steps:\s*(\d+)", stripped)
+        if m_steps:
+            result["metrics"]["num_steps"] = int(m_steps.group(1))
+
+        m_depth = re.match(r"^depth:\s*(\d+)", stripped)
+        if m_depth:
+            result["metrics"]["depth"] = int(m_depth.group(1))
+
+        m_vram = re.match(r"^peak_vram_mb:\s*([\d.]+)", stripped)
+        if m_vram:
+            result["metrics"]["peak_vram_mb"] = float(m_vram.group(1))
+
+    return result
 
 
-def run_meta_analysis() -> None:
-    LOGGER.info("Running meta-analysis...")
-    run_script("meta_analyzer.py", [
-        "--results", str(RESULTS_DIR / "results.tsv"),
-        "--output", str(RESULTS_DIR / "analysis.md"),
-    ])
-    LOGGER.info("Meta-analysis complete.")
+def parse_mlx_output(log: str) -> Dict[str, Any]:
+    """Parse MLX training output (train_mlx.py)."""
+    result = {
+        "val_bpb": None,
+        "metrics": {},
+    }
+    for line in log.splitlines():
+        stripped = line.strip()
+        # MLX uses "val_bpb: 1.234567" format (same pattern, but also try colon-space)
+        m_bpb = re.match(r"^val_bpb:\s*([\d.]+)", stripped)
+        if m_bpb:
+            result["val_bpb"] = float(m_bpb.group(1))
+            continue
+
+        m_bpb2 = re.match(r"^val_bpb\s+([\d.]+)", stripped)
+        if m_bpb2:
+            result["val_bpb"] = float(m_bpb2.group(1))
+            continue
+
+        # training_seconds
+        m_sec = re.match(r"^training_seconds:\s*([\d.]+)", stripped)
+        if m_sec:
+            result["metrics"]["training_seconds"] = float(m_sec.group(1))
+            continue
+
+        # total_seconds (MLX-specific)
+        m_total = re.match(r"^total_seconds:\s*([\d.]+)", stripped)
+        if m_total:
+            result["metrics"]["total_seconds"] = float(m_total.group(1))
+            continue
+
+        # num_steps
+        m_steps = re.match(r"^num_steps:\s*(\d+)", stripped)
+        if m_steps:
+            result["metrics"]["num_steps"] = int(m_steps.group(1))
+            continue
+
+        # mfu_percent (if MLX reports it)
+        m_mfu = re.match(r"^mfu_percent:\s*([\d.]+)", stripped)
+        if m_mfu:
+            result["metrics"]["mfu_percent"] = float(m_mfu.group(1))
+            continue
+
+        # peak_vram_mb (MLX unified memory)
+        m_vram = re.match(r"^peak_vram_mb:\s*([\d.]+)", stripped)
+        if m_vram:
+            result["metrics"]["peak_vram_mb"] = float(m_vram.group(1))
+            continue
+
+        # depth (if reported)
+        m_depth = re.match(r"^depth:\s*(\d+)", stripped)
+        if m_depth:
+            result["metrics"]["depth"] = int(m_depth.group(1))
+            continue
+
+    return result
 
 
-def run_dashboard() -> None:
-    LOGGER.info("Generating dashboard...")
-    run_script("dashboard.py", [
-        "--results", str(RESULTS_DIR / "results.tsv"),
-        "--output-md", str(ROOT / "report.md"),
-        "--plots-dir", str(PLOTS_DIR),
-    ])
-    LOGGER.info("Dashboard updated.")
-
-
-def run_self_improvement(experiment_count: int) -> None:
-    LOGGER.info("Running self-improvement cycle...")
-    run_script("self_improve.py", [
-        "--experiments-done", str(experiment_count),
-        "--results-dir", str(RESULTS_DIR),
-        "--knowledge", str(ROOT / "knowledge.json"),
-    ])
-    LOGGER.info("Self-improvement complete.")
-
-
-def run_baseline_check(best_before: float | None) -> bool:
-    """Re-run baseline to check for metric drift. Returns True if stable."""
-    LOGGER.info("Running baseline check...")
-    # Reset train.py to baseline (would need to track this; simplify:
-    # just run current train.py and compare)
-    metrics = run_training(timeout=620)
-    if metrics is None:
-        LOGGER.warning("Baseline check failed")
-        return True  # don't block on this
-    after = metrics.get("val_bpb")
-    if best_before is not None and after is not None:
-        drift = abs(after - best_before)
-        LOGGER.info("Baseline drift: %.4f (before=%.4f, after=%.4f)", drift, best_before, after)
-        if drift > 0.01:
-            LOGGER.warning("BASELINE DRIFT EXCEEDS THRESHOLD! Investigate.")
-            return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Results recording
-# ---------------------------------------------------------------------------
-
-def append_tsv(commit_hash: str, val_bpb: float, memory_gb: float,
-               status: str, description: str) -> None:
-    tsv = RESULTS_DIR / "results.tsv"
-    write_header = not tsv.exists()
-    with open(tsv, "a") as f:
-        if write_header:
-            f.write("commit\tval_bpb\tmemory_gb\tstatus\tdescription\n")
-        f.write(f"{commit_hash}\t{val_bpb:.6f}\t{memory_gb:.1f}\t{status}\t{description}\n")
-
-
-def update_knowledge(exp_id: str, config: dict, val_bpb: float,
-                     status: str, description: str) -> None:
-    """Record result in the knowledge base."""
-    kb_module_path = str(SCRIPTS)
-    if kb_module_path not in sys.path:
-        sys.path.insert(0, kb_module_path)
-
-    try:
-        from knowledge_base import KnowledgeBase
-        kb_path = ROOT / "knowledge.json"
-        kb = KnowledgeBase(path=str(kb_path))
-        kb.record_result(exp_id, config, val_bpb, status, description)
-        kb.save()
-    except Exception as e:
-        LOGGER.error("Failed to update knowledge base: %s", e)
-        # Fallback: just append to TSV
-        LOGGER.info("Using TSV fallback instead")
-
-
-# ---------------------------------------------------------------------------
-# Experiment execution
-# ---------------------------------------------------------------------------
-
-def get_next_experiment(state: dict, design: dict | None) -> dict | None:
+def run_training(timeout: int = DEFAULT_TRAIN_TIMEOUT, engine: str = "pytorch") -> Dict[str, Any]:
     """
-    Ask the experiment designer / knowledge base for the next experiment.
-    Returns a dict with keys: {id, config, description, hypothesis, category}
+    Run training via the appropriate engine's script.
+    - pytorch: uv run train.py
+    - mlx: uv run train_mlx.py
+    Returns dict with val_bpb, metrics, status, log output.
     """
-    kb_path = ROOT / "knowledge.json"
-    exp_plan = ROOT / "scripts" / "experiments.json"
+    config = get_engine_config(engine)
+    train_script = config.get("train_script", "train.py")
 
-    # Prefer knowledge base suggestions
-    if kb_path.exists():
-        try:
-            with open(kb_path) as f:
-                kb_data = json.load(f)
-            suggestions = kb_data.get("experiments", [])
-            # Find first untried
-            tried = {e["id"] for e in kb_data.get("experiments", [])
-                     if "id" in e}
-            # Pull from experiment plan
-            if exp_plan.exists():
-                with open(exp_plan) as f:
-                    plans = json.load(f)
-                if isinstance(plans, dict):
-                    plans = plans.get("experiments", [])
-                for p in plans:
-                    pid = p.get("id", "")
-                    if pid not in tried:
-                        return {
-                            "id": pid,
-                            "config": p.get("changes", {}),
-                            "description": p.get("hypothesis", p.get("name", "")),
-                            "hypothesis": p.get("hypothesis", ""),
-                            "category": p.get("category", "unknown"),
-                        }
-        except (json.JSONDecodeError, KeyError, OSError):
-            pass
-
-    # Fallback: generate simple next experiment
-    n = state["experiment_count"] + 1
-    phase = state["phase"]
-
-    if phase == 1:
-        configs = [
-            {"name": "depth_12",   "changes": {"DEPTH": 12}, "desc": "Increase depth 8→12"},
-            {"name": "depth_10",   "changes": {"DEPTH": 10}, "desc": "Increase depth 8→10"},
-            {"name": "depth_6",    "changes": {"DEPTH": 6},  "desc": "Decrease depth 8→6"},
-            {"name": "lr_0.03",    "changes": {"MATRIX_LR": 0.03}, "desc": "Matrix LR 0.04→0.03"},
-            {"name": "lr_0.05",    "changes": {"MATRIX_LR": 0.05}, "desc": "Matrix LR 0.04→0.05"},
-            {"name": "batch_256",  "changes": {"DEVICE_BATCH_SIZE": 256}, "desc": "Batch size 128→256"},
-            {"name": "batch_64",   "changes": {"DEVICE_BATCH_SIZE": 64},  "desc": "Batch size 128→64"},
-            {"name": "warmup_005", "changes": {"WARMUP_RATIO": 0.05},     "desc": "Add 5% warmup"},
-            {"name": "wd_0.1",     "changes": {"WEIGHT_DECAY": 0.1},      "desc": "Weight decay 0.2→0.1"},
-            {"name": "wd_0.3",     "changes": {"WEIGHT_DECAY": 0.3},      "desc": "Weight decay 0.2→0.3"},
-        ]
-        idx = (n - 1) % len(configs)
-        c = configs[idx]
-        return {"id": f"exp_{n:03d}", "config": c["changes"],
-                "description": c["desc"], "hypothesis": c["desc"],
-                "category": _category_for(c["changes"])}
-    elif phase == 2:
-        return {"id": f"exp_{n:03d}", "config": {},
-                "description": f"Combination experiment #{n}",
-                "hypothesis": "Combine top improvements",
-                "category": "combination"}
-    else:
-        return {"id": f"exp_{n:03d}", "config": {},
-                "description": f"Radical experiment #{n}",
-                "hypothesis": "Try architectural change",
-                "category": "radical"}
-
-
-def _category_for(changes: dict) -> str:
-    arch_keys = {"DEPTH", "HEAD_DIM", "ASPECT_RATIO", "BLOCK_TYPE", "MLP_TYPE",
-                 "N_KV_HEAD", "WINDOW_PATTERN"}
-    opt_keys = {"MATRIX_LR", "EMBEDDING_LR", "WEIGHT_DECAY", "WARMUP_RATIO",
-                "WARMDOWN_RATIO", "ADAM_BETAS"}
-    train_keys = {"DEVICE_BATCH_SIZE", "TOTAL_BATCH_SIZE", "GRAD_CLIP"}
-    reg_keys = {"DROPOUT", "LABEL_SMOOTHING"}
-
-    keys = set(changes.keys())
-    if keys & arch_keys:
-        return "architecture"
-    if keys & opt_keys:
-        return "optimization"
-    if keys & train_keys:
-        return "training"
-    if keys & reg_keys:
-        return "regularization"
-    return "novel"
-
-
-def apply_experiment_config(experiment: dict) -> bool:
-    """
-    Apply the experiment's config changes to train.py.
-    Uses patch-based replacement for each parameter.
-    """
-    changes = experiment.get("config", {})
-    if not changes:
-        LOGGER.warning("No config changes for experiment %s", experiment.get("id"))
-        return False
-
-    train_py = ROOT / "train.py"
-    content = train_py.read_text()
-    original = content
-
-    # Parameter replacement map: key -> (old_pattern, new_value)
-    PARAM_PATTERNS = {
-        "DEPTH": (
-            r"^DEPTH\s*=\s*\d+",
-            lambda v: f"DEPTH = {v}"
-        ),
-        "ASPECT_RATIO": (
-            r"^ASPECT_RATIO\s*=\s*\d+",
-            lambda v: f"ASPECT_RATIO = {v}"
-        ),
-        "HEAD_DIM": (
-            r"^HEAD_DIM\s*=\s*\d+",
-            lambda v: f"HEAD_DIM = {v}"
-        ),
-        "WINDOW_PATTERN": (
-            r'^WINDOW_PATTERN\s*=\s*"[^"]*"',
-            lambda v: f'WINDOW_PATTERN = "{v}"'
-        ),
-        "MATRIX_LR": (
-            r"^MATRIX_LR\s*=\s*[\d.]+",
-            lambda v: f"MATRIX_LR = {v}"
-        ),
-        "EMBEDDING_LR": (
-            r"^EMBEDDING_LR\s*=\s*[\d.]+",
-            lambda v: f"EMBEDDING_LR = {v}"
-        ),
-        "WEIGHT_DECAY": (
-            r"^WEIGHT_DECAY\s*=\s*[\d.]+",
-            lambda v: f"WEIGHT_DECAY = {v}"
-        ),
-        "WARMUP_RATIO": (
-            r"^WARMUP_RATIO\s*=\s*[\d.]+",
-            lambda v: f"WARMUP_RATIO = {v}"
-        ),
-        "WARMDOWN_RATIO": (
-            r"^WARMDOWN_RATIO\s*=\s*[\d.]+",
-            lambda v: f"WARMDOWN_RATIO = {v}"
-        ),
-        "DEVICE_BATCH_SIZE": (
-            r"^DEVICE_BATCH_SIZE\s*=\s*\d+",
-            lambda v: f"DEVICE_BATCH_SIZE = {v}"
-        ),
-        "TOTAL_BATCH_SIZE": (
-            r"^TOTAL_BATCH_SIZE\s*=\s*[\d*]+",
-            lambda v: f"TOTAL_BATCH_SIZE = {v}"
-        ),
-        "ADAM_BETAS": (
-            r"^ADAM_BETAS\s*=\s*\([^)]*\)",
-            lambda v: f"ADAM_BETAS = {v}"
-        ),
+    result = {
+        "val_bpb": None,
+        "status": "success",
+        "duration": 0.0,
+        "log": "",
+        "metrics": {},
+        "error": "",
+        "engine": engine,
     }
 
-    import re
+    t0 = time.time()
+    try:
+        logger.info(f"Starting {engine} training: uv run {train_script} (timeout={timeout}s)")
+        proc = subprocess.run(
+            ["uv", "run", train_script],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ},
+        )
+        result["duration"] = time.time() - t0
+        result["log"] = proc.stdout + proc.stderr
 
-    for key, value in changes.items():
-        if key in PARAM_PATTERNS:
-            pattern, formatter = PARAM_PATTERNS[key]
-            new_line = formatter(value)
-            # Try matching the line
-            flags = re.MULTILINE
-            if re.search(pattern, content, flags):
-                content = re.sub(pattern, new_line, content, count=1, flags=flags)
-                LOGGER.info("  Applied %s = %s", key, value)
-            else:
-                LOGGER.warning("  Could not find pattern for %s in train.py", key)
+        # Parse output using engine-specific parser
+        if engine == "mlx":
+            parsed = parse_mlx_output(result["log"])
         else:
-            LOGGER.warning("  Unknown parameter %s (skipping)", key)
+            parsed = parse_pytorch_output(result["log"])
 
-    if content == original:
-        LOGGER.warning("  No changes applied to train.py!")
-        return False
+        result["val_bpb"] = parsed["val_bpb"]
+        result["metrics"] = parsed["metrics"]
 
-    train_py.write_text(content)
-    return True
+        # Check for failure signals
+        if proc.returncode != 0:
+            if "FAIL" in result["log"] or proc.returncode == 1:
+                result["status"] = "failed"
+                result["error"] = f"Training exited with code {proc.returncode}"
+            elif "nan" in result["log"].lower() or "isnan" in result["log"].lower():
+                result["status"] = "failed"
+                result["error"] = "Training diverged (NaN detected)"
+            else:
+                result["status"] = "crashed"
+                result["error"] = f"Training crashed (exit code {proc.returncode})"
+
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["duration"] = timeout
+        result["error"] = f"Training timed out after {timeout}s"
+    except Exception as e:
+        result["status"] = "crashed"
+        result["duration"] = time.time() - t0
+        result["error"] = str(e)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Main loops
+# Meta-analysis wrapper
 # ---------------------------------------------------------------------------
 
-def run_baseline() -> dict | None:
-    """Run a single baseline experiment."""
-    LOGGER.info("=" * 60)
-    LOGGER.info("BASELINE RUN")
-    LOGGER.info("=" * 60)
-    return run_training(timeout=620)
+def run_meta_analyzer(
+    results_tsv: str,
+    analysis_name: str = "latest",
+) -> Dict[str, Any]:
+    """Run the meta_analyzer script and return its output summary."""
+    analyzer = SCRIPT_DIR / "scripts" / "meta_analyzer.py"
+    if not analyzer.exists():
+        logger.warning("meta_analyzer.py not found - skipping")
+        return {}
 
-
-def run_loop(state: dict, max_experiments: int, phase: int = 1) -> None:
-    """
-    Main experiment loop.
-    """
-    state["phase"] = phase
-    baseline_val_bpb = None
-
-    # Read last known best from TSV
-    tsv = RESULTS_DIR / "results.tsv"
-    if tsv.exists():
-        for line in reversed(tsv.read_text().strip().splitlines()):
-            if line.startswith("commit"):
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 4 and parts[3] == "keep":
-                try:
-                    baseline_val_bpb = float(parts[1])
-                except ValueError:
-                    pass
-                break
-
-    LOGGER.info("=" * 60)
-    LOGGER.info("RESEARCH LOOP STARTING")
-    LOGGER.info("  Phase: %d", phase)
-    LOGGER.info("  Max experiments: %d", max_experiments)
-    LOGGER.info("  Starting from experiment: %d", state["experiment_count"] + 1)
-    if baseline_val_bpb is not None:
-        LOGGER.info("  Current best val_bpb: %.6f", baseline_val_bpb)
-    LOGGER.info("=" * 60)
-
-    best_val = baseline_val_bpb
-    start_time = time.monotonic()
+    analysis_dir = PROJECT_ROOT / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    output_md = analysis_dir / f"{analysis_name}_analysis.md"
 
     try:
-        for _ in range(max_experiments):
-            n = state["experiment_count"] + 1
+        proc = subprocess.run(
+            [
+                sys.executable, str(analyzer),
+                "--results", results_tsv,
+                "--output", str(output_md),
+                "--next-experiments", "10",
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            logger.info(f"Meta-analysis written to {output_md}")
+            return {"output": str(output_md), "status": "success"}
+        else:
+            logger.warning(f"Meta-analyzer exited with code {proc.returncode}")
+            return {"status": "error", "error": proc.stderr[:500]}
+    except Exception as e:
+        logger.warning(f"Meta-analyzer failed: {e}")
+        return {"status": "error", "error": str(e)}
 
-            # Periodic tasks
-            if n > 1 and (n - 1) % 20 == 0:
-                LOGGER.info("\n--- Periodic analysis at experiment %d ---", n)
-                run_meta_analysis()
-                run_dashboard()
 
-            if n > 1 and (n - 1) % 50 == 0:
-                LOGGER.info("\n=== SELF-IMPROVEMENT CYCLE at experiment %d ===", n)
-                run_self_improvement(n)
+# ---------------------------------------------------------------------------
+# Dashboard wrapper
+# ---------------------------------------------------------------------------
 
-            # Get next experiment plan
-            experiment = get_next_experiment(state, None)
-            if experiment is None:
-                LOGGER.warning("No experiment plan available, stopping.")
-                break
+def run_dashboard(
+    results_tsv: str,
+    plots_dir: str,
+) -> Dict[str, Any]:
+    """Run the dashboard script to generate plots and reports."""
+    dashboard = SCRIPT_DIR / "scripts" / "dashboard.py"
+    if not dashboard.exists():
+        logger.warning("dashboard.py not found - skipping")
+        return {}
 
-            LOGGER.info("\n%s Experiment %d: %s [%s]",
-                        "=" * 40, n, experiment.get("description", ""),
-                        experiment.get("category", ""))
-            if experiment.get("hypothesis"):
-                LOGGER.info("  Hypothesis: %s", experiment["hypothesis"])
-            LOGGER.info("  Config: %s", experiment.get("config", {}))
+    report_md = PROJECT_ROOT / "analysis" / "latest_report.md"
 
-            # Save pre-experiment train.py for recovery
-            train_py = ROOT / "train.py"
-            pre_content = train_py.read_text()
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(dashboard),
+                "--results", results_tsv,
+                "--plots-dir", plots_dir,
+                "--output-md", str(report_md),
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            logger.info(f"Dashboard generated plots in {plots_dir}")
+            return {"plots_dir": plots_dir, "report": str(report_md), "status": "success"}
+        else:
+            logger.warning(f"Dashboard exited with code {proc.returncode}")
+            return {"status": "error", "error": proc.stderr[:500]}
+    except Exception as e:
+        logger.warning(f"Dashboard failed: {e}")
+        return {"status": "error", "error": str(e)}
 
-            # Apply changes
-            if experiment.get("config"):
-                ok = apply_experiment_config(experiment)
-                if not ok:
-                    LOGGER.warning("Failed to apply changes, skipping.")
-                    append_tsv("skip", 0.0, 0.0, "skip", experiment.get("description", ""))
-                    state["experiment_count"] += 1
-                    save_state(state)
-                    continue
 
-            # Commit
-            commit_msg = f"exp_{n:03d}: [{experiment.get('category', '?')}] {experiment.get('description', '')}"
-            commit_hash = commit_changes(commit_msg)
-            if commit_hash is None:
-                commit_hash = f"skip_{n}"
+# ---------------------------------------------------------------------------
+# Self-improve wrapper
+# ---------------------------------------------------------------------------
 
-            # Run training
-            LOGGER.info("  Starting training (timeout: 10 min)...")
-            metrics = run_training(timeout=620)
+def run_self_improve(
+    results_tsv: str,
+    knowledge_path: str,
+) -> Dict[str, Any]:
+    """Run the self_improve script to update train.py based on learnings."""
+    self_improve = SCRIPT_DIR / "scripts" / "self_improve.py"
+    if not self_improve.exists():
+        logger.warning("self_improve.py not found - skipping")
+        return {}
 
-            if metrics is None:
-                LOGGER.warning("  CRASH / TIMEOUT — reverting")
-                status = "crash"
-                val_bpb = 0.0
-                memory_gb = 0.0
-            else:
-                val_bpb = metrics.get("val_bpb", 0.0)
-                memory_gb = metrics.get("peak_vram_mb", 0.0) / 1024
-                elapsed = time.monotonic() - start_time
-                eta = "?"
-                if n > 0:
-                    avg_time = elapsed / n
-                    remaining = (max_experiments - n) * avg_time
-                    eta = str(timedelta(seconds=int(remaining)))
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, str(self_improve),
+                "--results", results_tsv,
+                "--knowledge", knowledge_path,
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if proc.returncode == 0:
+            logger.info("Self-improve applied successfully")
+            return {"status": "success"}
+        else:
+            logger.warning(f"Self-improve exited with code {proc.returncode}")
+            return {"status": "error", "error": proc.stderr[:500]}
+    except Exception as e:
+        logger.warning(f"Self-improve failed: {e}")
+        return {"status": "error", "error": str(e)}
 
-                LOGGER.info("  RESULT: val_bpb=%.6f  VRAM=%.1fGB  "
-                            "steps=%s  (%d/%d done, ETA: %s)",
-                            val_bpb, memory_gb,
-                            metrics.get("num_steps", "?"),
-                            n, max_experiments, eta)
 
-                if best_val is not None:
-                    delta = -(val_bpb - best_val)
-                    if delta > 0.001:
-                        status = "keep"
-                        best_val = val_bpb
-                        state["best_val_bpb"] = best_val
-                        LOGGER.info("  ** IMPROVEMENT! Delta: +%.6f", delta)
-                    else:
-                        status = "discard"
-                        LOGGER.info("  No improvement (delta: %.6f)", delta)
-                else:
-                    status = "keep"
-                    best_val = val_bpb
-                    state["best_val_bpb"] = best_val
+# ---------------------------------------------------------------------------
+# Experiment queue generation
+# ---------------------------------------------------------------------------
 
-            # Record results
-            append_tsv(commit_hash, val_bpb, memory_gb, status,
-                      experiment.get("description", ""))
-            update_knowledge(
-                experiment.get("id", f"exp_{n:03d}"),
-                experiment.get("config", {}),
-                val_bpb,
-                status,
-                experiment.get("description", ""),
+def get_experiment_queue(
+    mode: str,
+    count: int,
+    knowledge_path: str,
+    state: RunState,
+) -> List[Dict[str, Any]]:
+    """
+    Generate or resume an experiment queue using the orchestrator /
+    experiment_designer.
+    """
+    designer = SCRIPT_DIR / "scripts" / "experiment_designer.py"
+    orchestrator = SCRIPT_DIR / "scripts" / "research_orchestrator.py"
+
+    # Resume: use pending experiments from state
+    if state.pending_experiments:
+        logger.info(f"Resuming with {len(state.pending_experiments)} pending experiments")
+        return state.pending_experiments
+
+    # Try experiment_designer first
+    if designer.exists():
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable, str(designer),
+                    "--mode", mode,
+                    "--count", str(count),
+                    "--knowledge", knowledge_path,
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
+            if proc.returncode == 0 and proc.stdout.strip():
+                queue = json.loads(proc.stdout)
+                if isinstance(queue, list):
+                    logger.info(f"Loaded {len(queue)} experiments from experiment_designer")
+                    return queue
+        except Exception as e:
+            logger.warning(f"experiment_designer failed: {e}")
 
-            # Revert on discard/crash
-            if status in ("discard", "crash"):
-                commit_hash_for_reset = get_current_commit()
-                # Find previous good commit
-                try:
-                    parent = run_git("rev-parse", "HEAD~1").stdout.strip()
-                    reset_to_commit(parent)
-                except subprocess.CalledProcessError:
-                    # If reset fails, restore file content
-                    train_py.write_text(pre_content)
-                    run_git("checkout", "train.py", check=False)
+    # Fallback: use research_orchestrator
+    if orchestrator.exists():
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable, str(orchestrator),
+                    "--generate",
+                    "--count", str(count),
+                    "--mode", mode,
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                queue = json.loads(proc.stdout)
+                if isinstance(queue, list):
+                    logger.info(f"Loaded {len(queue)} experiments from orchestrator")
+                    return queue
+        except Exception as e:
+            logger.warning(f"orchestrator generate failed: {e}")
 
-            # Update state
-            state["experiment_count"] = n
-            state["status"] = "running"
-            save_state(state)
+    # Ultimate fallback: generate a simple inline queue
+    logger.info("Using inline experiment generation fallback")
+    return generate_simple_queue(mode, count)
 
-    except KeyboardInterrupt:
-        LOGGER.info("\nInterrupted! Saving state for resume...")
-        state["status"] = "interrupted"
-        save_state(state)
-        LOGGER.info("State saved. Resume with: python launch.py --resume")
 
-    # Final summary
-    end_time = time.monotonic()
-    total_time = end_time - start_time
-    LOGGER.info("\n" + "=" * 60)
-    LOGGER.info("RESEARCH SESSION COMPLETE")
-    LOGGER.info("  Experiments: %d", state["experiment_count"])
-    LOGGER.info("  Duration: %s", str(timedelta(seconds=int(total_time))))
-    LOGGER.info("  Best val_bpb: %s", state.get("best_val_bpb", "N/A"))
-    LOGGER.info("  Avg time/experiment: %.1fs",
-                total_time / max(state["experiment_count"], 1))
-    LOGGER.info("=" * 60)
+def generate_simple_queue(mode: str, count: int) -> List[Dict[str, Any]]:
+    """Generate a basic experiment queue as fallback."""
+    experiments = []
+
+    # Learning rate sweep
+    for lr in [0.001, 0.003, 0.005, 0.01, 0.03]:
+        experiments.append({
+            "experiment_id": f"exp_{len(experiments)+1:03d}",
+            "changes": {"LEARNING_RATE": lr},
+            "category": "optimization",
+            "hypothesis": f"LR {lr} for convergence tuning",
+            "priority": 8,
+        })
+
+    # Architecture depth
+    for depth in [4, 8, 12, 16]:
+        experiments.append({
+            "experiment_id": f"exp_{len(experiments)+1:03d}",
+            "changes": {"DEPTH": depth},
+            "category": "architecture",
+            "hypothesis": f"Depth {depth} capacity test",
+            "priority": 7,
+        })
+
+    # Batch size
+    for bs in [32, 64, 128, 256]:
+        experiments.append({
+            "experiment_id": f"exp_{len(experiments)+1:03d}",
+            "changes": {"BATCH_SIZE": bs},
+            "category": "training",
+            "hypothesis": f"Batch size {bs}",
+            "priority": 6,
+        })
+
+    # Dropout
+    for do in [0.0, 0.05, 0.1, 0.2]:
+        experiments.append({
+            "experiment_id": f"exp_{len(experiments)+1:03d}",
+            "changes": {"DROPOUT": do},
+            "category": "regularization",
+            "hypothesis": f"Dropout {do}",
+            "priority": 5,
+        })
+
+    # Sequence length
+    for sl in [512, 1024, 4096]:
+        experiments.append({
+            "experiment_id": f"exp_{len(experiments)+1:03d}",
+            "changes": {"SEQ_LEN": sl},
+            "category": "training",
+            "hypothesis": f"Seq len {sl}",
+            "priority": 6,
+        })
+
+    # Filter and limit
+    experiments = experiments[:count]
+
+    if mode == "deep" or mode == "recursive":
+        for i, e1 in enumerate(experiments[:5]):
+            for e2 in experiments[i+1:8]:
+                if len(experiments) >= count:
+                    break
+                combined = {
+                    "experiment_id": f"combo_{len(experiments)+1:03d}",
+                    "changes": {**e1["changes"], **e2["changes"]},
+                    "category": "combo",
+                    "hypothesis": f"Combo: {e1['hypothesis']} + {e2['hypothesis']}",
+                    "priority": 9,
+                }
+                experiments.append(combined)
+
+    return experiments[:count]
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Progress display
 # ---------------------------------------------------------------------------
+
+def print_banner() -> None:
+    width = 70
+    engine_label = get_engine().upper()
+    print()
+    print("=" * width)
+    print(f"  AUTORESEARCH v2: Recursive Self-Improving ML Research System  [{engine_label}]")
+    print("=" * width)
+    print(f"  Project root : {PROJECT_ROOT}")
+    print(f"  Branch       : {git_current_branch()}")
+    print(f"  Engine       : {_current_engine}")
+    print(f"  Results dir  : {RESULTS_DIR}")
+    print(f"  State file   : {STATE_FILE}")
+    print(f"  TSV file     : {TSV_FILE}")
+    print(f"  Python       : {sys.version.split()[0]}")
+    print("=" * width)
+    print()
+
+
+def print_progress(
+    current: int,
+    total: int,
+    experiment_id: str,
+    experiment_name: str,
+    val_bpb: Optional[float],
+    delta: Optional[float],
+    best_bpb: Optional[float],
+    duration: float,
+    status: str,
+    start_time: float,
+) -> None:
+    """Print a single-line progress update."""
+    elapsed = time.time() - start_time
+    eta = "?"
+    if current > 0:
+        avg_time = elapsed / current
+        remaining = (total - current) * avg_time
+        eta = f"{remaining/60:.0f}m"
+
+    bpb_str = f"{val_bpb:.6f}" if val_bpb is not None else "N/A"
+    delta_str = f"{delta:+.6f}" if delta is not None else "N/A"
+    best_str = f"{best_bpb:.6f}" if best_bpb is not None else "N/A"
+
+    status_icon = {
+        "success": "[OK]",
+        "failed": "[FAIL]",
+        "crashed": "[CRASH]",
+        "timeout": "[TO]",
+    }.get(status, "[??]")
+
+    print(
+        f"  {current}/{total} {status_icon} | {experiment_id:12s} | "
+        f"bpb={bpb_str} delta={delta_str} | "
+        f"best={best_str} | {duration:6.1f}s | "
+        f"{experiment_name} | ETA:{eta}"
+    )
+
+
+def print_summary(state: RunState, baseline_bpb: Optional[float]) -> None:
+    """Print final run summary."""
+    width = 70
+    print()
+    print("=" * width)
+    print(f"  RUN SUMMARY [{get_engine().upper()}]")
+    print("=" * width)
+    print(f"  Mode                 : {state.mode}")
+    print(f"  Engine               : {state.engine}")
+    print(f"  Total experiments    : {state.experiments_completed}")
+    print(f"  Failed               : {state.experiments_failed}")
+    total = state.experiments_completed + state.experiments_failed
+    success_rate = (state.experiments_completed / max(total, 1)) * 100
+    print(f"  Success rate         : {success_rate:.1f}%")
+    print(f"  Best val_bpb         : {state.best_val_bpb:.6f}" if state.best_val_bpb else "  Best val_bpb         : N/A")
+    print(f"  Best experiment      : {state.best_experiment_id}")
+    if baseline_bpb and state.best_val_bpb:
+        total_improvement = baseline_bpb - state.best_val_bpb
+        print(f"  Total improvement    : {total_improvement:+.6f}")
+    print(f"  Results TSV          : {TSV_FILE}")
+    print(f"  Knowledge base       : {PROJECT_ROOT / 'knowledge.json'}")
+    print(f"  Plots                : {PLOTS_DIR}")
+    print(f"  State (resumable)    : {STATE_FILE}")
+    print("=" * width)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main execution loop
+# ---------------------------------------------------------------------------
+
+_interrupted = False
+_current_engine = "pytorch"
+
+
+def handle_interrupt(signum, frame):
+    global _interrupted
+    _interrupted = True
+    logger.info("\nInterrupt received! Saving state and shutting down gracefully...")
+
 
 def main():
+    global _interrupted, _current_engine
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
+
     parser = argparse.ArgumentParser(
-        description="Autoresearch v2 — Recursive Self-Improving ML Research",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        description="Autoresearch v2: Recursive Self-Improving ML Research System",
     )
-    parser.add_argument("--mode", choices=["baseline", "single", "night", "deep", "recursive"],
-                        default="single", help="Research mode")
-    parser.add_argument("-n", "--num-experiments", type=int, default=10,
-                        help="Number of experiments (single/deep mode)")
-    parser.add_argument("--branch", type=str, default=None,
-                        help="Git branch name")
-    parser.add_argument("--phase", type=int, default=1,
-                        help="Research phase (1-4)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from saved state")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Verbose logging")
-    parser.add_argument("--timeout", type=int, default=620,
-                        help="Training timeout in seconds")
-    parser.add_argument("--max-experiments", type=int, default=None,
-                        help="Override max experiments for any mode")
-
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "single", "night", "deep", "recursive"],
+        required=True,
+        help="Execution mode",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["pytorch", "mlx"],
+        default="pytorch",
+        help="ML engine to use: pytorch (train.py) or mlx (train_mlx.py). Default: pytorch",
+    )
+    parser.add_argument(
+        "-n", "--num-experiments",
+        type=int,
+        default=None,
+        help="Number of experiments to run (default: mode-dependent)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TRAIN_TIMEOUT,
+        help=f"Training timeout in seconds (default: {DEFAULT_TRAIN_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--meta-interval",
+        type=int,
+        default=META_ANALYZER_INTERVAL,
+        help=f"Run meta-analysis every N experiments (default: {META_ANALYZER_INTERVAL})",
+    )
+    parser.add_argument(
+        "--self-improve-interval",
+        type=int,
+        default=SELF_IMPROVE_INTERVAL,
+        help=f"Run self-improve every N experiments (default: {SELF_IMPROVE_INTERVAL})",
+    )
+    parser.add_argument(
+        "--knowledge",
+        type=str,
+        default=str(PROJECT_ROOT / "knowledge.json"),
+        help="Path to knowledge base file",
+    )
+    parser.add_argument(
+        "--phase",
+        type=int,
+        default=1,
+        help="Experiment phase number",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from last checkpoint if available (default: True)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing state and start fresh",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print experiment queue without executing",
+    )
     args = parser.parse_args()
-    setup_logging(verbose=args.verbose)
 
-    # Determine branch
-    branch = args.branch
-    if branch is None:
-        try:
-            r = run_git("rev-parse", "--abbrev-ref", "HEAD", check=False)
-            branch = r.stdout.strip()
-        except Exception:
-            branch = "autoresearch/v2"
-    if args.mode in ("night", "deep", "recursive"):
-        branch = f"autoresearch/v2-{datetime.now(timezone.utc):%b%d}"
+    # Set the global engine context
+    _current_engine = args.engine
 
-    state = load_state() if args.resume else _default_state()
-    state["mode"] = args.mode
-    state["branch"] = branch
-    state["started_at"] = datetime.now(timezone.utc).isoformat()
+    print_banner()
 
-    max_exp = args.max_experiments or {
-        "baseline": 0,
-        "single": args.num_experiments,
-        "night": 100,
-        "deep": 200,
-        "recursive": 500,
-    }.get(args.mode, 10)
+    # Determine experiment count
+    mode_counts = {
+        "baseline": 1,
+        "single": args.num_experiments or 10,
+        "night": args.num_experiments or DEFAULT_NIGHT_COUNT,
+        "deep": args.num_experiments or 50,
+        "recursive": args.num_experiments or 200,
+    }
+    count = mode_counts[args.mode]
 
-    LOGGER.info("Starting Autoresearch v2")
-    LOGGER.info("  Mode: %s | Branch: %s | Phase: %d | Max experiments: %d",
-                args.mode, branch, args.phase, max_exp)
+    # Load or initialize state
+    state = RunState()
+    if args.resume and not args.no_resume:
+        saved_state = load_state()
+        if saved_state:
+            state = saved_state
+            if state.interrupted:
+                logger.info("Resuming from previous interrupted run")
+            else:
+                logger.info(f"Loaded state: {state.experiments_completed} completed, {len(state.pending_experiments)} pending")
+            # Ensure engine matches resumed state, or warn
+            if hasattr(state, 'engine') and state.engine and state.engine != _current_engine:
+                logger.warning(f"Resumed state used engine '{state.engine}', but current engine is '{_current_engine}'")
 
-    # Ensure git branch
-    try:
-        ensure_branch(branch)
-    except Exception as e:
-        LOGGER.error("Git setup failed: %s", e)
-        sys.exit(1)
+    state.mode = args.mode
+    state.engine = _current_engine
 
+    # Initialize knowledge base
+    logger.info(f"Engine: {_current_engine} | Knowledge base: {args.knowledge}")
+
+    # Get experiment queue
+    logger.info(f"Mode: {args.mode} | Experiments: {count} | Phase: {args.phase}")
+    logger.info("Generating experiment queue...")
+    queue = get_experiment_queue(args.mode, count, args.knowledge, state)
+
+    if args.dry_run:
+        logger.info("DRY RUN - Experiment queue:")
+        for i, exp in enumerate(queue):
+            changes_str = ", ".join(f"{k}={v}" for k, v in exp.get("changes", {}).items())
+            print(f"  {i+1}. [{exp.get('experiment_id', '?')}] {changes_str} | {exp.get('hypothesis', '')}")
+        print(f"\nTotal: {len(queue)} experiments")
+        return
+
+    # Filter out already-completed experiments
+    completed_ids = state.completed_ids
+    queue = [e for e in queue if e.get("experiment_id") not in completed_ids]
+    logger.info(f"Experiment queue: {len(queue)} experiments remaining")
+
+    if not queue:
+        logger.info("No experiments remaining. Done!")
+        state.start_time = state.start_time or datetime.now(timezone.utc).isoformat()
+        print_summary(state, None)
+        return
+
+    # Run experiments
+    baseline_bpb = None
+    train_file = PROJECT_ROOT / "train.py"
+
+    # MLX: for baseline mode, just run train_mlx.py directly (no config changes)
     if args.mode == "baseline":
-        metrics = run_baseline()
-        if metrics:
-            LOGGER.info("Baseline val_bpb: %.6f", metrics["val_bpb"])
-            LOGGER.info("Baseline VRAM: %.1f MB", metrics.get("peak_vram_mb", 0))
-            append_tsv(get_current_commit(), metrics["val_bpb"],
-                      metrics.get("peak_vram_mb", 0) / 1024,
-                      "keep", "baseline")
-        sys.exit(0 if metrics else 1)
+        logger.info(f"Running baseline experiment (engine={_current_engine})...")
+        # Use the engine's default script without config mutations
+        baseline_result = run_training(timeout=args.timeout, engine=_current_engine)
+        logger.info(f"Baseline result: {baseline_result['status']} val_bpb={baseline_result['val_bpb']}")
+        if baseline_result["val_bpb"] is not None:
+            baseline_bpb = baseline_result["val_bpb"]
+            append_tsv(
+                experiment_id="baseline_001",
+                experiment_name="Baseline",
+                val_bpb=baseline_bpb,
+                delta=None,
+                phase=args.phase,
+                status=baseline_result["status"],
+                duration=baseline_result["duration"],
+                changes="none",
+                notes="Initial baseline measurement",
+                engine=_current_engine,
+            )
+        state.experiments_completed = 1
+        state.best_val_bpb = baseline_bpb
+        state.best_experiment_id = "baseline_001"
+        save_state(state)
+        print_summary(state, baseline_bpb)
+        return
 
-    # Signal handler for graceful shutdown
-    def sigint_handler(sig, frame):
-        raise KeyboardInterrupt()
-    signal.signal(signal.SIGINT, sigint_handler)
+    # For non-baseline modes, we mutate the config and run experiments
+    start_time = time.time()
 
-    # Run the loop
-    run_loop(state, max_exp, phase=args.phase)
+    for idx, experiment in enumerate(queue):
+        if _interrupted:
+            logger.info("Interrupt detected - saving state before exit")
+            state.pending_experiments = queue[idx:]
+            state.interrupted = True
+            save_state(state)
+            break
+
+        exp_id = experiment.get("experiment_id", f"exp_{idx:03d}")
+        changes = experiment.get("changes", {})
+        hypothesis = experiment.get("hypothesis", "")
+        category = experiment.get("category", "unknown")
+
+        changes_str = ", ".join(f"{k}={v}" for k, v in changes.items())
+        logger.info(f"\n--- Experiment {idx+1}/{len(queue)}: {exp_id} [{category}] ({_current_engine}) ---")
+        logger.info(f"  Changes: {changes_str}")
+        logger.info(f"  Hypothesis: {hypothesis}")
+
+        # Step 1: Apply changes (only for pytorch, or if target file exists)
+        applied = None
+        if changes:
+            applied = apply_changes_to_train(changes, engine=_current_engine)
+            if applied is None:
+                logger.error("Failed to apply changes, skipping experiment")
+                state.experiments_failed += 1
+                state.completed_ids.add(exp_id)
+                append_tsv(exp_id, category, None, None, args.phase, "failed", 0, changes_str,
+                           "Failed to apply changes", engine=_current_engine)
+                save_state(state)
+                continue
+
+        # Step 2: Run training
+        logger.info(f"  Running {_current_engine} training (timeout: {args.timeout}s)...")
+        result = run_training(timeout=args.timeout, engine=_current_engine)
+
+        # Step 3: Record result
+        val_bpb = result["val_bpb"]
+        delta = None
+        if baseline_bpb is not None and val_bpb is not None:
+            delta = baseline_bpb - val_bpb
+
+        # Update best
+        if val_bpb is not None:
+            if state.best_val_bpb is None or val_bpb < state.best_val_bpb:
+                state.best_val_bpb = val_bpb
+                state.best_experiment_id = exp_id
+
+            # Record in knowledge base
+            kb_record_result = record_in_knowledge(
+                args.knowledge,
+                exp_id,
+                changes,
+                val_bpb,
+                result["status"],
+                applied or changes_str,
+            )
+
+        status = result["status"]
+        is_success = status == "success" and val_bpb is not None
+
+        if is_success:
+            state.experiments_completed += 1
+        else:
+            state.experiments_failed += 1
+            logger.warning(f"  Experiment failed: {result.get('error', status)}")
+
+        state.experiment_count = idx + 1
+        state.last_experiment_id = exp_id
+        state.last_val_bpb = val_bpb
+        state.completed_ids.add(exp_id)
+
+        # Append to TSV
+        append_tsv(
+            experiment_id=exp_id,
+            experiment_name=f"{category}:{changes_str}",
+            val_bpb=val_bpb,
+            delta=delta,
+            phase=args.phase,
+            status=status,
+            duration=result["duration"],
+            changes=changes_str,
+            notes=hypothesis[:200] if hypothesis else "",
+            engine=_current_engine,
+        )
+
+        # Print progress
+        print_progress(
+            current=state.experiments_completed + state.experiments_failed,
+            total=len(queue),
+            experiment_id=exp_id,
+            experiment_name=category,
+            val_bpb=val_bpb,
+            delta=delta,
+            best_bpb=state.best_val_bpb,
+            duration=result["duration"],
+            status=status,
+            start_time=start_time,
+        )
+
+        # Step 4: Meta-analysis at intervals
+        total_done = state.experiments_completed + state.experiments_failed
+        if total_done > 0 and total_done % args.meta_interval == 0:
+            logger.info(f"--- Meta-analysis at experiment {total_done} ---")
+            run_meta_analyzer(str(TSV_FILE), f"phase{args.phase}_exp{total_done}")
+            run_dashboard(str(TSV_FILE), str(PLOTS_DIR))
+
+        # Step 5: Self-improve at intervals
+        if args.mode == "recursive" and total_done > 0 and total_done % args.self_improve_interval == 0:
+            logger.info(f"--- Self-improve cycle at experiment {total_done} ---")
+            self_improve_result = run_self_improve(str(TSV_FILE), args.knowledge)
+            if self_improve_result.get("status") == "success":
+                logger.info("Self-improve applied - train script updated")
+                if state.best_val_bpb is not None:
+                    baseline_bpb = state.best_val_bpb
+                    logger.info(f"New baseline set to {baseline_bpb:.6f}")
+            else:
+                logger.warning(f"Self-improve failed: {self_improve_result.get('error', 'unknown')}")
+
+        # Deep mode: run meta-analysis more frequently
+        if args.mode == "deep" and total_done > 0 and total_done % 10 == 0:
+            logger.info(f"--- Deep analysis at experiment {total_done} ---")
+            run_meta_analyzer(str(TSV_FILE), f"deep_{total_done}")
+
+        # Save checkpoint
+        save_state(state)
+
+        # Reset training script for next experiment
+        git_reset_train(_current_engine)
+
+    # Final summary
+    if _interrupted:
+        logger.info("Run was interrupted; state saved for resume")
+
+    # Final meta-analysis and dashboard
+    if state.experiments_completed > 0:
+        run_meta_analyzer(str(TSV_FILE), "final")
+        run_dashboard(str(TSV_FILE), str(PLOTS_DIR))
+
+    print_summary(state, baseline_bpb)
+
+
+def record_in_knowledge(
+    kb_path: str,
+    exp_id: str,
+    changes: Dict[str, Any],
+    val_bpb: float,
+    status: str,
+    notes: str,
+) -> Optional[str]:
+    """Record experiment result in the knowledge base."""
+    kb_script = SCRIPT_DIR / "scripts" / "knowledge_base.py"
+    if not kb_script.exists():
+        return None
+
+    status_map = {
+        "success": "confirmed",
+        "failed": "failed",
+        "crashed": "failed",
+        "timeout": "failed",
+    }
+    kb_status = status_map.get(status, "tentative")
+
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("knowledge_base", kb_script)
+        kb_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(kb_module)
+
+        KB = kb_module.KnowledgeBase
+        kb = KB(path=kb_path)
+        record = kb.record_result(exp_id, changes, val_bpb, kb_status, notes)
+        return record.get("id", exp_id)
+    except Exception as e:
+        logger.warning(f"Failed to record in knowledge base: {e}")
+        return None
 
 
 if __name__ == "__main__":
