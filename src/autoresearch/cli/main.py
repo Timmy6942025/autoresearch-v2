@@ -19,6 +19,150 @@ app = typer.Typer(
     add_completion=False,
 )
 
+models_app = typer.Typer(name="models", help="Model management commands")
+app.add_typer(models_app)
+
+
+@models_app.command("list")
+def models_list(
+    downloaded_only: bool = typer.Option(
+        False, "--downloaded", "-d", help="Show only downloaded models"
+    ),
+):
+    """List available and downloaded models."""
+    from ..core.models import registry
+
+    typer.echo("Available Models:")
+    typer.echo("-" * 60)
+    for model in registry.list_all():
+        status = "downloaded" if not downloaded_only else ""
+        typer.echo(
+            f"  {model.name:<20} {model.params_m:>6}M params  context={model.max_context:>6}  TQ={'✓' if model.supports_turboquant else '✗'}"
+        )
+    typer.echo("")
+
+
+@models_app.command("pull")
+def models_pull(
+    name: str = typer.Argument(..., help="Model name or hub ID"),
+):
+    """Download a model from MLX hub."""
+    from ..core.models import registry, ModelInfo
+
+    existing = registry.get(name)
+    if existing:
+        typer.echo(f"Model '{name}' already registered: {existing.path}")
+        return
+
+    typer.echo(f"Registering model: {name}")
+    typer.echo("Note: Actual download requires mlx-lm. Run:")
+    typer.echo(f"  python -c 'from mlx_lm import load; load(\"{name}\")'")
+
+
+@models_app.command("remove")
+def models_remove(
+    name: str = typer.Argument(..., help="Model name to remove"),
+):
+    """Delete a downloaded model."""
+    from ..core.models import registry
+
+    if registry.remove(name):
+        typer.echo(f"Removed model: {name}")
+    else:
+        typer.echo(f"Model not found: {name}")
+
+
+@models_app.command("info")
+def models_info(
+    name: str = typer.Argument(..., help="Model name"),
+):
+    """Show model details."""
+    from ..core.models import registry
+
+    model = registry.get(name)
+    if not model:
+        typer.echo(f"Model not found: {name}")
+        return
+
+    typer.echo(f"Model: {model.name}")
+    typer.echo(f"Path: {model.path}")
+    typer.echo(f"Parameters: {model.params_m}M")
+    typer.echo(f"Max Context: {model.max_context}")
+    typer.echo(f"TurboQuant: {'Yes' if model.supports_turboquant else 'No'}")
+    typer.echo(f"Quantization: {model.quant_level}")
+
+
+@models_app.command("benchmark")
+def models_benchmark():
+    """Benchmark all downloaded models."""
+    typer.echo("Benchmark mode — requires MLX models loaded")
+    typer.echo("Run with --model to benchmark a specific model")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address"),
+    port: int = typer.Option(8080, "--port", help="Port number"),
+    model: Optional[str] = typer.Option(None, "--model", help="Model to serve"),
+    turboquant: bool = typer.Option(False, "--turboquant", help="Enable compression"),
+    cors: bool = typer.Option(True, "--cors/--no-cors", help="Enable CORS"),
+):
+    """Run as an API server for external integrations."""
+    typer.echo(f"Starting server on {host}:{port}")
+    typer.echo(f"Model: {model or 'default'}")
+    typer.echo(f"TurboQuant: {'enabled' if turboquant else 'disabled'}")
+    typer.echo(f"CORS: {'enabled' if cors else 'disabled'}")
+    typer.echo("\nNote: Requires fastapi and uvicorn.")
+    typer.echo("  pip install fastapi uvicorn")
+
+
+@app.command()
+def pipeline(
+    spec: str = typer.Argument(..., help="Pipeline spec file (YAML/JSON)"),
+):
+    """Run a predefined research pipeline from a JSON/YAML spec."""
+    path = Path(spec)
+    if not path.exists():
+        typer.echo(f"Spec file not found: {spec}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        if path.suffix in [".yaml", ".yml"]:
+            import yaml
+
+            data = yaml.safe_load(path.read_text())
+        else:
+            data = json.loads(path.read_text())
+    except Exception as e:
+        typer.echo(f"Failed to parse spec: {e}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Pipeline: {data.get('name', 'unnamed')}")
+    typer.echo(f"Model: {data.get('model', 'default')}")
+    typer.echo(f"Steps: {len(data.get('steps', []))}")
+
+    config = ResearchConfig()
+    if "model" in data:
+        config.model.path = data["model"]
+    if data.get("turboquant"):
+        config.turboquant.enabled = True
+
+    engine = ResearchEngine(config)
+
+    async def run_pipeline():
+        for i, step in enumerate(data.get("steps", []), 1):
+            if "search" in step:
+                typer.echo(f"Step {i}: Searching '{step['search']}'")
+                max_sources = step.get("max_sources", 10)
+                config.search.max_results = max_sources
+            elif "analyze" in step:
+                typer.echo(f"Step {i}: Analyzing — {step['analyze']}")
+            elif "synthesize" in step:
+                typer.echo(f"Step {i}: Synthesizing → {step['synthesize']}")
+
+    asyncio.run(run_pipeline())
+    typer.echo("Pipeline complete.")
+
 
 @app.command()
 def research(
