@@ -37,15 +37,20 @@ class MLXBackend:
         temperature: float = 0.7,
         top_p: float = 0.9,
         turboquant: bool = False,
+        target_bits: float = 4.5,
+        block_size: int = 128,
     ):
         self.model_path = model_path
         self.max_context = max_context
         self.temperature = temperature
         self.top_p = top_p
         self.turboquant = turboquant
+        self.target_bits = target_bits
+        self.block_size = block_size
         self._model = None
         self._tokenizer = None
         self._loaded = False
+        self._kv_cache = None
 
     def load(self) -> bool:
         """Load the MLX model. Returns True on success."""
@@ -56,6 +61,17 @@ class MLXBackend:
             logger.info(f"Loading model: {self.model_path}")
             self._model, self._tokenizer = load(self.model_path)
             self._loaded = True
+
+            if self.turboquant:
+                from ..turboquant.cache import CompressedKVCache
+
+                self._kv_cache = CompressedKVCache(
+                    method="turboquant",
+                    target_bits=self.target_bits,
+                    block_size=self.block_size,
+                )
+                logger.info("TurboQuant KV cache compression enabled")
+
             logger.info("Model loaded successfully")
             return True
         except ImportError:
@@ -171,3 +187,13 @@ class MLXBackend:
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def get_turboquant_stats(self) -> Dict[str, Any]:
+        """Get TurboQuant compression statistics."""
+        if not self._kv_cache:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "cache_size": self._kv_cache.size,
+            **self._kv_cache.get_stats(),
+        }
