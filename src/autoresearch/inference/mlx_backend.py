@@ -100,33 +100,66 @@ class MLXBackend:
                 )
 
         try:
-            from mlx_lm import generate
+            import mlx.core as mx
+            from mlx_lm.sample_utils import make_sampler
+            from mlx_lm.utils import generate_step
 
             temp = temperature or self.temperature
             tp = top_p or self.top_p
 
             start_time = time.time()
 
-            text = generate(
-                self._model,
-                self._tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temp=temp,
-                top_p=tp,
-                verbose=False,
-            )
+            prompt_tokens = self._tokenizer.encode(prompt)
+            prompt_arr = mx.array(prompt_tokens)
 
+            sampler = make_sampler(temp=temp, top_p=tp)
+            tokens = []
+            cache = None
+
+            if self.turboquant and self._kv_cache:
+                from mlx_lm.models.base import make_prompt_cache
+
+                cache = make_prompt_cache(self._model)
+
+                for token in generate_step(
+                    prompt_arr, self._model, cache=cache, sampler=sampler
+                ):
+                    token_val = token[0] if isinstance(token, tuple) else token
+                    tokens.append(token_val.item())
+                    if len(tokens) >= max_tokens:
+                        break
+
+                    if len(tokens) % 16 == 0:
+                        for i, c in enumerate(cache):
+                            if hasattr(c, "keys") and hasattr(c, "values"):
+                                k_compressed = self._kv_cache.compressor.compress(
+                                    c.keys
+                                )
+                                v_compressed = self._kv_cache.compressor.compress(
+                                    c.values
+                                )
+                                self._kv_cache.put(
+                                    f"layer_{i}_k_{len(tokens)}", k_compressed
+                                )
+                                self._kv_cache.put(
+                                    f"layer_{i}_v_{len(tokens)}", v_compressed
+                                )
+            else:
+                for token in generate_step(prompt_arr, self._model, sampler=sampler):
+                    token_val = token[0] if isinstance(token, tuple) else token
+                    tokens.append(token_val.item())
+                    if len(tokens) >= max_tokens:
+                        break
+
+            text = self._tokenizer.decode(tokens)
             gen_time = time.time() - start_time
-            tokens = len(self._tokenizer.encode(text))
-            prompt_tokens = len(self._tokenizer.encode(prompt))
 
             return GenerationResult(
                 text=text,
-                tokens_generated=tokens,
-                prompt_tokens=prompt_tokens,
+                tokens_generated=len(tokens),
+                prompt_tokens=len(prompt_tokens),
                 generation_time=gen_time,
-                tokens_per_second=tokens / max(gen_time, 0.001),
+                tokens_per_second=len(tokens) / max(gen_time, 0.001),
                 peak_memory_mb=self._get_memory_usage(),
             )
         except Exception as e:
