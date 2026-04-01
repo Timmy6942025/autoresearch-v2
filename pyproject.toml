@@ -27,7 +27,7 @@ dependencies = [
 [project.scripts]
 autoresearch = "autoresearch.cli.main:main"
 
-[[tool.uv.sources]]
+[tool.uv.sources]
 turboquant-mlx = { git = "https://github.com/sharpner/turboquant-mlx.git" }
 
 [project.optional-dependencies]

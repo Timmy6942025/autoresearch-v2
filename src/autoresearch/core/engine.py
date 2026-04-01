@@ -15,7 +15,10 @@ from ..agents.search_agent import SearchAgent
 from ..agents.crawler import CrawlerAgent
 from ..agents.analyst import AnalystAgent
 from ..agents.writer import WriterAgent
+from ..documents.parser import DocumentParser, DocumentChunker
+from ..scheduler.dispatcher import TaskDispatcher, Task
 from .config import ResearchConfig
+from .state import ResearchState, StateManager, CacheManager
 
 logger = logging.getLogger("autoresearch.engine")
 
@@ -23,21 +26,30 @@ logger = logging.getLogger("autoresearch.engine")
 class ResearchEngine:
     """Orchestrates the multi-agent research loop.
 
-    The engine coordinates multiple specialized agents to:
-    1. Plan research strategy
-    2. Search for information
-    3. Crawl and extract content
-    4. Analyze findings
-    5. Synthesize reports
+    Full pipeline:
+    1. Planner decomposes query into subtasks
+    2. Search agents run parallel queries
+    3. Crawler fetches and extracts content
+    4. Analyst extracts insights from all content
+    5. Writer synthesizes comprehensive report
+    6. State persisted, results cached
     """
 
     def __init__(self, config: Optional[ResearchConfig] = None):
         self.config = config or ResearchConfig()
         self.agents: Dict[str, Agent] = {}
+        self.state = ResearchState()
+        self.state_manager = StateManager()
+        self.cache = CacheManager(
+            cache_dir=self.config.cache.directory,
+            max_size_mb=self.config.cache.max_size_mb,
+        )
+        self.dispatcher = TaskDispatcher(
+            max_workers=self.config.crawler.concurrent,
+        )
         self._initialize_agents()
 
     def _initialize_agents(self) -> None:
-        """Create and register all research agents."""
         self.agents["planner"] = PlannerAgent()
         self.agents["search"] = SearchAgent(max_results=self.config.search.max_results)
         self.agents["crawler"] = CrawlerAgent(
@@ -54,30 +66,27 @@ class ResearchEngine:
         max_iterations: Optional[int] = None,
         output_path: Optional[str] = None,
         output_format: str = "markdown",
+        files: Optional[List[str]] = None,
     ) -> str:
-        """Execute a full research loop.
-
-        Args:
-            query: The research query
-            depth: Research depth (brief, medium, deep)
-            max_iterations: Maximum research iterations
-            output_path: Path to save the report
-            output_format: Output format (markdown, json)
-
-        Returns:
-            The generated research report
-        """
-        iterations = max_iterations or {
-            "brief": 3,
-            "medium": 7,
-            "deep": 15,
-        }.get(depth, 7)
-
-        logger.info(
-            f"Starting research: '{query}' (depth={depth}, iterations={iterations})"
+        """Execute a full multi-agent research loop."""
+        iterations = max_iterations or {"brief": 3, "medium": 7, "deep": 15}.get(
+            depth, 7
         )
 
-        # Step 1: Plan
+        self.state = ResearchState(
+            query=query,
+            status="running",
+            started_at=time.time(),
+        )
+
+        logger.info(
+            "Starting research: '%s' (depth=%s, iterations=%d)",
+            query,
+            depth,
+            iterations,
+        )
+
+        # Step 1: Plan — decompose query into subtasks
         logger.info("Step 1: Planning research strategy")
         plan_result = await self.agents["planner"].run(query)
         try:
@@ -85,58 +94,118 @@ class ResearchEngine:
         except json.JSONDecodeError:
             plan = {"objective": query, "subtasks": []}
 
-        # Step 2: Search
-        logger.info("Step 2: Searching for information")
-        search_result = await self.agents["search"].run(query)
-        try:
-            search_results = json.loads(search_result)
-        except json.JSONDecodeError:
-            search_results = []
+        self.state.metadata["plan"] = plan
 
-        # Step 3: Crawl
-        logger.info("Step 3: Crawling relevant pages")
+        # Step 2: Parallel search — run multiple search queries from plan
+        logger.info("Step 2: Searching for information")
+        search_queries = [query]
+        for subtask in plan.get("subtasks", []):
+            if subtask.get("agent") == "search":
+                search_queries.append(subtask["task"])
+
+        search_tasks = [
+            self.agents["search"].run(q)
+            for q in search_queries[: self.config.agent.parallel_searches]
+        ]
+        search_results_raw = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        search_results = []
+        for raw in search_results_raw:
+            if isinstance(raw, Exception):
+                logger.warning("Search failed: %s", raw)
+                continue
+            try:
+                results = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(results, list):
+                    search_results.extend(results)
+            except json.JSONDecodeError:
+                pass
+
+        # Deduplicate by URL
+        seen_urls = set()
+        unique_results = []
+        for r in search_results:
+            url = r.get("url", r.get("href", ""))
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_results.append(r)
+        search_results = unique_results[: self.config.search.max_results]
+
+        # Step 3: Crawl — fetch content from search results in parallel
+        logger.info("Step 3: Crawling relevant pages (%d URLs)", len(search_results))
         urls = [
             r.get("url", r.get("href", ""))
             for r in search_results
             if r.get("url") or r.get("href")
         ]
 
+        crawled_content = []
         if urls:
             crawl_input = json.dumps({"urls": urls[:10]})
             crawl_result = await self.agents["crawler"].run(crawl_input)
             try:
-                crawled_content = json.loads(crawl_result)
+                crawled_content = (
+                    json.loads(crawl_result)
+                    if isinstance(crawl_result, str)
+                    else crawl_result
+                )
             except json.JSONDecodeError:
                 crawled_content = []
-        else:
-            crawled_content = []
 
-        # Step 4: Analyze
+        # Step 3b: Process local documents if provided
+        document_content = []
+        if files:
+            logger.info("Step 3b: Processing %d local documents", len(files))
+            for file_path in files:
+                result = DocumentParser.parse(file_path)
+                if result.get("success"):
+                    chunks = DocumentChunker.chunk(
+                        result.get("content", ""), max_chunk_size=2000
+                    )
+                    for i, chunk in enumerate(chunks):
+                        document_content.append(
+                            {
+                                "source": file_path,
+                                "chunk": i,
+                                "title": result.get("title", file_path),
+                                "content": chunk,
+                            }
+                        )
+
+        # Step 4: Analyze — extract insights from all content
         logger.info("Step 4: Analyzing findings")
-        all_content = []
+        all_text_parts = []
         for item in search_results:
-            all_content.append(item.get("snippet", item.get("body", "")))
+            all_text_parts.append(item.get("snippet", item.get("body", "")))
         for item in crawled_content:
-            if item.get("success"):
-                all_content.append(item.get("content", ""))
+            if isinstance(item, dict) and item.get("success"):
+                all_text_parts.append(item.get("content", ""))
+        for item in document_content:
+            all_text_parts.append(item.get("content", ""))
 
-        combined_text = "\n\n".join(all_content)
+        combined_text = "\n\n".join(all_text_parts)
+        analysis = {}
         if combined_text:
             analysis_input = json.dumps(
                 {
-                    "text": combined_text[:10000],
+                    "text": combined_text[:15000],
                     "analysis_type": "keywords",
                 }
             )
             analysis_result = await self.agents["analyst"].run(analysis_input)
             try:
-                analysis = json.loads(analysis_result)
+                analysis = (
+                    json.loads(analysis_result)
+                    if isinstance(analysis_result, str)
+                    else analysis_result
+                )
             except json.JSONDecodeError:
                 analysis = {}
-        else:
-            analysis = {}
 
-        # Step 5: Synthesize
+        self.state.analysis = analysis
+        self.state.findings = search_results
+
+        # Step 5: Synthesize — generate comprehensive report
         logger.info("Step 5: Synthesizing report")
         findings = []
         for item in search_results:
@@ -145,6 +214,23 @@ class ResearchEngine:
                     "title": item.get("title", ""),
                     "url": item.get("url", item.get("href", "")),
                     "content": item.get("snippet", item.get("body", "")),
+                }
+            )
+        for item in crawled_content:
+            if isinstance(item, dict) and item.get("success"):
+                findings.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("content", "")[:2000],
+                    }
+                )
+        for item in document_content:
+            findings.append(
+                {
+                    "title": f"[Document] {item.get('title', '')}",
+                    "url": "",
+                    "content": item.get("content", ""),
                 }
             )
 
@@ -158,21 +244,35 @@ class ResearchEngine:
         )
 
         report = await self.agents["writer"].run(report_input)
+        self.state.report = report
+        self.state.status = "completed"
+        self.state.completed_at = time.time()
 
-        # Save report
+        # Persist state
+        self.state_manager.save(self.state)
+
+        # Save report to file
         if output_path:
             path = Path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(report)
-            logger.info(f"Report saved to: {output_path}")
+            logger.info("Report saved to: %s", output_path)
+
+        # Cache the result
+        if self.config.cache.enabled:
+            cache_key = f"research:{query}:{depth}"
+            self.cache.set(
+                cache_key, {"report": report, "findings": findings}, ttl=86400
+            )
 
         logger.info("Research complete")
         return report
 
     def get_agent(self, name: str) -> Optional[Agent]:
-        """Get an agent by name."""
         return self.agents.get(name)
 
     def list_agents(self) -> List[str]:
-        """List all registered agents."""
         return list(self.agents.keys())
+
+    def get_state(self) -> ResearchState:
+        return self.state
