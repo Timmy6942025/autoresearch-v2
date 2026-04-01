@@ -108,12 +108,9 @@ def serve(
     cors: bool = typer.Option(True, "--cors/--no-cors", help="Enable CORS"),
 ):
     """Run as an API server for external integrations."""
-    typer.echo(f"Starting server on {host}:{port}")
-    typer.echo(f"Model: {model or 'default'}")
-    typer.echo(f"TurboQuant: {'enabled' if turboquant else 'disabled'}")
-    typer.echo(f"CORS: {'enabled' if cors else 'disabled'}")
-    typer.echo("\nNote: Requires fastapi and uvicorn.")
-    typer.echo("  pip install fastapi uvicorn")
+    from ..server import run_server
+
+    run_server(host=host, port=port, enable_cors=cors)
 
 
 @app.command()

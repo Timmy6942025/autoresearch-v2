@@ -34,4 +34,5 @@ turboquant-mlx = { git = "https://github.com/sharpner/turboquant-mlx.git" }
 # PyTorch kept for comparison/benchmarking only
 pytorch   = ["torch==2.9.1", "kernels>=0.11.7"]
 turboquant = ["turboquant-mlx"]
-dev       = ["pytest", "black", "mypy", "ruff"]
+server    = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
+dev       = ["pytest", "pytest-asyncio", "black", "mypy", "ruff", "httpx"]

@@ -2,8 +2,8 @@
 
 [![Platform](https://img.shields.io/badge/platform-Apple_Silicon-blue)](https://developer.apple.com/metal/)
 [![MLX](https://img.shields.io/badge/framework-MLX-orange)](https://github.com/ml-explore/mlx)
-[![Python](https://img.shields.io/badge/python-3.11+-green)](https://www.python.org/)
-[![turboquant-mlx](https://img.shields.io/badge/turboquant--mlx-v0.3.0-red)](./turboquant-mlx/)
+[![Python](https://img.shields.io/badge/python-3.10+-green)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-36%20passing-brightgreen)](./tests/)
 
 **Autonomous deep research agent for Apple Silicon.** AutoResearch v2 is a complete migration of the original PyTorch/CUDA research system to Apple's MLX framework, enabling state-of-the-art autonomous research, multi-agent collaboration, and long-context analysis entirely on consumer hardware — no cloud GPUs required.
 
@@ -239,80 +239,83 @@ reconstructed = compressor.decompress(compressed)  # ~99.1% fidelity
 autoresearch-v2/
 ├── README.md                          # This file
 ├── pyproject.toml                     # Project metadata & dependencies
-├── requirements.txt                   # pip requirements
+├── experiment_config.py               # Config-driven hyperparameter management
+├── shared_prepare.py                  # Framework-agnostic data pipeline
+├── train.py                           # PyTorch pretraining (legacy)
+├── train_mlx.py                       # MLX pretraining
+├── launch.py                          # Experiment orchestrator (legacy)
+├── prepare.py                         # Data pipeline (legacy)
+├── scripts/                           # Meta-analysis scripts (legacy)
+├── tests/                             # Test suite (36 tests)
+│   ├── test_experiment_config.py
+│   ├── test_launch_parsing.py
+│   ├── test_multi_agent.py
+│   └── test_e2e.py
 └── src/
     └── autoresearch/
         ├── __init__.py                # Package init
-        ├── __main__.py                # CLI entry point
+        ├── __main__.py                # CLI entry point (python -m autoresearch)
+        ├── server.py                  # FastAPI server (/research, /status, /health)
         │
         ├── core/                      # Core research engine
         │   ├── __init__.py
-        │   ├── engine.py              # Main research orchestration engine
+        │   ├── engine.py              # Main research orchestration (5-agent loop)
         │   ├── config.py              # Configuration management (YAML/JSON)
-        │   ├── models.py              # Model loading, MLX integration
-        │   └── state.py               # Research state persistence
+        │   ├── models.py              # Model registry with default MLX models
+        │   └── state.py               # Research state persistence + caching
         │
-        ├── agents/                    # Multi-agent system
+        ├── agents/                    # Multi-agent system (5 agents)
         │   ├── __init__.py
-        │   ├── base.py                # Base agent class (MLX-compatible)
-        │   ├── planner.py             # Research planner agent
-        │   ├── search_agent.py        # Web search agent (DuckDuckGo)
-        │   ├── crawler.py             # Async web crawler (aiohttp)
-        │   ├── analyst.py             # Data analysis agent
-        │   └── writer.py              # Report synthesis agent
+        │   ├── base.py                # Agent, Message, Tool base classes
+        │   ├── planner.py             # Research planning & task decomposition
+        │   ├── search_agent.py        # DuckDuckGo web search
+        │   ├── crawler.py             # Async web fetching + content extraction
+        │   ├── analyst.py             # Data analysis & keyword extraction
+        │   └── writer.py              # Report synthesis (markdown/JSON/HTML)
         │
         ├── inference/                 # MLX inference backend
         │   ├── __init__.py
-        │   ├── mlx_backend.py         # Primary MLX inference engine
-        │   ├── model_registry.py      # Model discovery & loading
-        │   └── kv_cache.py            # KV cache management
+        │   ├── mlx_backend.py         # MLX model loading & text generation
+        │   └── kv_cache.py            # KV cache management with TurboQuant
         │
-        ├── turboquant/                # turboquant-mlx integration
+        ├── turboquant/                # KV cache compression pipeline
         │   ├── __init__.py
         │   ├── compressor.py          # Main compressor (rotation + LM + QJL)
-        │   ├── rotation.py            # Rotation optimization
+        │   ├── rotation.py            # Rotation optimization (PCA-based)
         │   ├── lloyd_max.py           # Lloyd-Max codebook quantizer
         │   ├── qjl.py                 # Quantized joint low-rank decomposition
-        │   ├── kernels/               # Custom Metal kernels
-        │   │   ├── dequantize.metal   # Fused dequantization kernel
-        │   │   └── rotation.metal     # Fused rotation kernel
-        │   └── cache.py               # KV cache with transparent compression
+        │   └── cache.py               # Transparent compressed KV cache
         │
         ├── search/                    # Information retrieval
         │   ├── __init__.py
         │   ├── duckduckgo.py          # DuckDuckGo search adapter
-        │   ├── fetch.py               # URL content fetching
+        │   ├── fetch.py               # Async URL fetching (httpx)
         │   └── cache.py               # Search result caching
         │
         ├── documents/                 # Document processing
         │   ├── __init__.py
-        │   ├── parser.py              # Multi-format parser (PDF, HTML, TXT)
-        │   ├── chunker.py             # Semantic chunking
-        │   └── embeddings.py          # MLX-based embedding generation
+        │   ├── parser.py              # Multi-format parser (PDF, HTML, TXT, JSON)
+        │   └── chunker.py             # Semantic sentence/paragraph chunking
         │
         ├── synthesis/                 # Report generation
         │   ├── __init__.py
         │   ├── synthesizer.py         # Multi-source synthesis engine
-        │   ├── templates.py           # Report templates
-        │   └── formatter.py           # Markdown/HTML/PDF output
+        │   ├── templates.py           # Report templates (brief/detailed/pipeline)
+        │   └── formatter.py           # Output formatting (md/html/json)
         │
         ├── scheduler/                 # Task scheduling
         │   ├── __init__.py
-        │   ├── dispatcher.py          # Async task dispatcher
-        │   ├── queue.py               # Priority task queue
-        │   └── monitor.py             # Task progress monitoring
+        │   └── dispatcher.py          # Async task dispatcher with priority queue
         │
-        ├── cli/                       # Command-line interface
+        ├── cli/                       # Command-line interface (Typer)
         │   ├── __init__.py
-        │   ├── main.py                # CLI argument parsing (argparse)
-        │   ├── interactive.py         # Interactive REPL mode
-        │   └── progress.py            # Rich progress bars & display
+        │   └── main.py                # CLI commands: research, serve, models, etc.
         │
         └── utils/                     # Shared utilities
             ├── __init__.py
-            ├── logging.py             # Structured logging
+            ├── logging.py             # Structured logging setup
             ├── memory.py              # Memory usage tracking
-            └── timing.py              # Performance profiling
+            └── timing.py              # Performance profiling & timing
 ```
 
 ---
@@ -330,28 +333,23 @@ autoresearch-v2/
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/autoresearch-v2.git
+git clone https://github.com/Timmy6942025/autoresearch-v2.git
 cd autoresearch-v2
 
-# Create a virtual environment
-python3 -m venv .venv
+# Create a virtual environment (using uv)
+uv venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install -e ".[all]"
+uv pip install -e ".[dev,server]"
 
-# Verify MLX installation
-python3 -c "import mlx; print(f'MLX {mlx.__version__} on Apple Silicon')"
+# Verify installation
+python -m autoresearch --help
 ```
 
-### Install turboquant-mlx
+### Optional: TurboQuant KV Cache Compression
 
-```bash
-# turboquant-mlx is included as a submodule
-cd turboquant-mlx
-pip install -e .
-cd ..
-```
+TurboQuant is built into `src/autoresearch/turboquant/` — no external submodule needed. It uses pure MLX operations for the 3-stage compression pipeline (rotation + Lloyd-Max + QJL).
 
 ### Download Models
 
@@ -498,7 +496,7 @@ autoresearch benchmark [OPTIONS]
 
 ### 5. Server Mode
 
-Run as an API server for external integrations:
+Run as a FastAPI server for external integrations:
 
 ```bash
 autoresearch serve [OPTIONS]
@@ -508,9 +506,29 @@ autoresearch serve [OPTIONS]
 |---|---|---|
 | `--host` | Bind address | `127.0.0.1` |
 | `--port` | Port number | `8080` |
-| `--model` | Model to serve | `Llama-3.2-3B-Instruct-4bit` |
 | `--turboquant` | Enable compression | `false` |
 | `--cors` | Enable CORS | `true` |
+
+**API Endpoints:**
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/research` | Submit a research query, returns full report |
+| `GET` | `/research/{id}` | Get a past research result |
+| `GET` | `/status` | Server status and active research info |
+| `GET` | `/health` | Health check |
+| `GET` | `/models` | List available models |
+
+**Example:**
+```bash
+# Start server
+autoresearch serve --port 8080
+
+# Submit research via curl
+curl -X POST http://localhost:8080/research \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is MLX?", "depth": "brief", "max_sources": 5}'
+```
 
 ### 6. Pipeline Mode
 
@@ -769,17 +787,14 @@ pip install -e ".[dev]"
 ### Running Tests
 
 ```bash
-# Unit tests
+# All tests (36 tests)
 pytest tests/ -v
 
-# TurboQuant-specific tests
-pytest tests/turboquant/ -v
+# E2E integration tests (real DuckDuckGo queries)
+pytest tests/test_e2e.py -v
 
-# Integration tests (requires models)
-pytest tests/integration/ -v --models
-
-# Benchmark
-autoresearch benchmark --warmup 3 --runs 10
+# Multi-agent system tests
+pytest tests/test_multi_agent.py -v
 ```
 
 ### Code Style
@@ -793,29 +808,26 @@ ruff format src/
 
 ```
 tests/
-├── unit/              # Unit tests (no model required)
-├── integration/       # Integration tests (model required)
-├── turboquant/        # TurboQuant-specific tests
-│   ├── test_rotation.py
-│   ├── test_lloyd_max.py
-│   ├── test_qjl.py
-│   └── test_compression.py
-└── benchmarks/        # Performance benchmarks
+├── test_experiment_config.py    # Config-driven experiment tests
+├── test_launch_parsing.py       # Log parsing tests
+├── test_multi_agent.py          # Agent initialization and engine tests
+└── test_e2e.py                  # End-to-end integration tests (real web queries)
 ```
 
 ### Adding New Models to Registry
 
-Models are auto-discovered from the MLX hub. To register a custom model:
+Models are registered in `src/autoresearch/core/models.py`. Add to `DEFAULT_MODELS`:
 
 ```python
-from autoresearch.inference import register_model
+from autoresearch.core.models import ModelInfo, registry
 
-register_model(
-    name="my-custom-7b",
-    path="path/to/mlx/model",
+registry.register(ModelInfo(
+    name="my-model-7b",
+    path="mlx-community/MyModel-7B-Instruct-4bit",
+    params_m=7000,
     max_context=32768,
     supports_turboquant=True,
-)
+))
 ```
 
 ---
@@ -824,7 +836,7 @@ register_model(
 
 AutoResearch v2 is released under the MIT License. See [LICENSE](LICENSE) for details.
 
-turboquant-mlx is available under the Apache 2.0 License. See [turboquant-mlx/LICENSE](turboquant-mlx/LICENSE) for details.
+TurboQuant compression is implemented natively in `src/autoresearch/turboquant/` using MLX operations.
 
 ---
 
