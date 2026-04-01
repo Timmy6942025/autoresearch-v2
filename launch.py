@@ -5,8 +5,8 @@ Autoresearch v2: Recursive Self-Improving ML Research System.
 Master entry point that orchestrates the full research loop:
   1. Initialize / load knowledge base
   2. Get next experiment from orchestrator / experiment_designer
-  3. Apply changes to train.py (read / modify / write)
-  4. Run `uv run train.py` or `uv run train_mlx.py` with timeout
+  3. Write experiment config (JSON) — no source mutation
+  4. Run `uv run train.py --config ...` or `uv run train_mlx.py --config ...`
   5. Parse val_bpb and metrics from run output
   6. Record result in knowledge base + results.tsv
   7. Every N experiments: run meta_analyzer + dashboard
@@ -43,11 +43,17 @@ import signal
 import subprocess
 import sys
 import time
-import traceback
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from experiment_config import (
+    HyperparamConfig,
+    write_config,
+    default_config,
+    apply_config_to_script,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,50 +72,16 @@ META_ANALYZER_INTERVAL = 20  # run meta analysis every N experiments
 SELF_IMPROVE_INTERVAL = 50   # run self-improve every N experiments
 DEFAULT_NIGHT_COUNT = 100
 
-# Engine-specific paths and settings
 ENGINE_CONFIG = {
     "pytorch": {
         "train_script": "train.py",
-        "target_file": "train.py",
         "reset_target": "train.py",
-        "output_prefix": "results/",
     },
     "mlx": {
         "train_script": "train_mlx.py",
-        "target_file": "train.py",  # MLX still reads hyperparams from shared config
-        "reset_target": "train.py",
-        "output_prefix": "results/",
+        "reset_target": "train_mlx.py",
     },
 }
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOGS_DIR / "launch.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("launch")
-
-# ---------------------------------------------------------------------------
-# Global engine context (set by main(), read by helpers)
-# ---------------------------------------------------------------------------
-
-_current_engine: str = "pytorch"
-
-
-def get_engine() -> str:
-    """Return the current engine being used."""
-    return _current_engine
 
 
 def get_engine_config(engine: str) -> Dict[str, str]:
@@ -177,17 +149,15 @@ _TSV_HEADER = (
 )
 
 
-def _ensure_tsv_header() -> bool:
-    """Ensure the TSV file has a header. Returns True if file was created."""
+def _ensure_tsv_header() -> None:
     if not TSV_FILE.exists() or TSV_FILE.stat().st_size == 0:
         TSV_FILE.parent.mkdir(parents=True, exist_ok=True)
         TSV_FILE.write_text(_TSV_HEADER + "\n", encoding="utf-8")
-        return True
-    # If old header without engine column, check
-    first_line = TSV_FILE.open(encoding="utf-8").readline().strip()
+        return
+    with open(TSV_FILE, encoding="utf-8") as f:
+        first_line = f.readline().strip()
     if "engine" not in first_line:
-        return True  # will be handled by append
-    return False
+        TSV_FILE.write_text(_TSV_HEADER + "\n", encoding="utf-8")
 
 
 def append_tsv(
@@ -217,37 +187,6 @@ def append_tsv(
 # ---------------------------------------------------------------------------
 # Git helpers
 # ---------------------------------------------------------------------------
-
-def git_commit(message: str) -> Optional[str]:
-    """Stage changes and commit. Returns commit hash or None on failure."""
-    try:
-        subprocess.run(
-            ["git", "add", "-A"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        result = subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            hash_result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return hash_result.stdout.strip()
-    except Exception as e:
-        logger.debug(f"Git commit failed: {e}")
-    return None
-
 
 def git_current_branch() -> str:
     try:
@@ -280,100 +219,25 @@ def git_reset_train(engine: str = "pytorch") -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# train.py / train_mlx.py mutation
-# ---------------------------------------------------------------------------
-
-def apply_changes_to_train(changes: Dict[str, Any], engine: str = "pytorch") -> Optional[str]:
-    """
-    Apply parameter changes to the training script by modifying constants.
-    For MLX, edits train.py which shares config with train_mlx.py.
-    Returns a description of changes made, or None on failure.
-    """
-    config = get_engine_config(engine)
-    train_path = PROJECT_ROOT / config.get("target_file", "train.py")
-    if not train_path.exists():
-        logger.error(f"{train_path.name} not found!")
-        return None
-
-    content = train_path.read_text()
-    original = content
-    applied = []
-
-    # Mapping from experiment param names to variable names
-    PARAM_MAP = {
-        "DEPTH": ("n_layer", int),
-        "DIM": ("n_embd", int),
-        "N_HEAD": ("n_head", int),
-        "N_KV_HEAD": ("n_kv_head", int),
-        "HEAD_DIM": ("head_dim", int),
-        "LEARNING_RATE": ("learning_rate", float),
-        "LR": ("learning_rate", float),
-        "WARMUP_PCT": ("warmup_pct", float),
-        "WARMUP_STEPS": ("warmup_steps", int),
-        "WEIGHT_DECAY": ("weight_decay", float),
-        "BATCH_SIZE": ("batch_size", int),
-        "SEQ_LEN": ("sequence_len", int),
-        "GRAD_CLIP": ("clip_grad_norm", float),
-        "CLIP_GRAD_NORM": ("clip_grad_norm", float),
-        "DROPOUT": ("dropout", float),
-        "LABEL_SMOOTHING": ("label_smoothing", float),
-        "MOMENTUM": ("muon_momentum", float),
-        "STOCHASTIC_DEPTH": ("stochastic_depth", float),
-        "WINDOW_PATTERN": ("window_pattern", str),
-        "MLP_TYPE": ("mlp_type", str),
-        "BLOCK_TYPE": ("block_type", str),
-        # MLX-specific aliases
-        "TOTAL_BATCH_SIZE": ("TOTAL_BATCH_SIZE", int),
-        "DEVICE_BATCH_SIZE": ("DEVICE_BATCH_SIZE", int),
-        "TIME_BUDGET": ("TIME_BUDGET", int),
-        "EMBEDDING_LR": ("EMBEDDING_LR", float),
-        "MATRIX_LR": ("MATRIX_LR", float),
-        "SCALAR_LR": ("SCALAR_LR", float),
-        "ADAM_BETAS": ("ADAM_BETAS", str),
-        "MAX_GRAD_NORM": ("MAX_GRAD_NORM", float),
-        "WARMUP_RATIO": ("WARMUP_RATIO", float),
-    }
-
+def write_experiment_config(
+    changes: Dict[str, Any],
+    exp_id: str,
+    engine: str = "pytorch",
+) -> Optional[Path]:
+    base = default_config(engine)
+    resolved = {}
     for param, value in changes.items():
-        key, dtype = PARAM_MAP.get(param, (None, None))
-        if key is None:
-            logger.warning(f"Unknown param '{param}' - skipping")
-            continue
-
-        if dtype == str:
-            patterns = [
-                rf'^(\s*{re.escape(key)}\s*=\s*)(["\']).*?\2',
-                rf"^(\s*{re.escape(key)}\s*=\s*)\S+",
-            ]
+        field_name = resolve_alias(param)
+        if field_name:
+            resolved[field_name] = value
         else:
-            patterns = [
-                rf"^(\s*{re.escape(key)}\s*=\s*)\S+",
-            ]
-
-        replaced = False
-        for pattern in patterns:
-            match = re.search(pattern, content, re.MULTILINE)
-            if match:
-                if dtype == str:
-                    new_line = f'{match.group(1)}"{value}"'
-                elif dtype == int:
-                    new_line = f"{match.group(1)}{int(value)}"
-                else:
-                    new_line = f"{match.group(1)}{float(value)}"
-                content = content[:match.start()] + new_line + content[match.end():]
-                replaced = True
-                break
-
-        if replaced:
-            applied.append(f"{param}={value}")
-        else:
-            logger.warning(f"Could not find '{key}' in {train_path.name} for param '{param}'")
-
-    if applied:
-        train_path.write_text(content)
-        return ", ".join(applied)
-    return None
+            logger.warning(f"Unknown param '{param}' — skipping")
+    if not resolved:
+        return None
+    base_dict = base.to_dict()
+    base_dict.update(resolved)
+    cfg = HyperparamConfig.from_dict(base_dict)
+    return write_config(cfg, engine=engine, experiment_id=exp_id)
 
 
 # ---------------------------------------------------------------------------
@@ -477,13 +341,12 @@ def parse_mlx_output(log: str) -> Dict[str, Any]:
     return result
 
 
-def run_training(timeout: int = DEFAULT_TRAIN_TIMEOUT, engine: str = "pytorch") -> Dict[str, Any]:
-    """
-    Run training via the appropriate engine's script.
-    - pytorch: uv run train.py
-    - mlx: uv run train_mlx.py
-    Returns dict with val_bpb, metrics, status, log output.
-    """
+def run_training(
+    timeout: int = DEFAULT_TRAIN_TIMEOUT,
+    engine: str = "pytorch",
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Run training via the appropriate engine's script."""
     config = get_engine_config(engine)
     train_script = config.get("train_script", "train.py")
 
@@ -497,11 +360,15 @@ def run_training(timeout: int = DEFAULT_TRAIN_TIMEOUT, engine: str = "pytorch") 
         "engine": engine,
     }
 
+    cmd = ["uv", "run", train_script]
+    if config_path:
+        cmd.extend(["--config", str(config_path)])
+
     t0 = time.time()
     try:
-        logger.info(f"Starting {engine} training: uv run {train_script} (timeout={timeout}s)")
+        logger.info(f"Starting {engine} training: {' '.join(cmd)} (timeout={timeout}s)")
         proc = subprocess.run(
-            ["uv", "run", train_script],
+            cmd,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -814,16 +681,15 @@ def generate_simple_queue(mode: str, count: int) -> List[Dict[str, Any]]:
 # Progress display
 # ---------------------------------------------------------------------------
 
-def print_banner() -> None:
+def print_banner(engine: str) -> None:
     width = 70
-    engine_label = get_engine().upper()
     print()
     print("=" * width)
-    print(f"  AUTORESEARCH v2: Recursive Self-Improving ML Research System  [{engine_label}]")
+    print(f"  AUTORESEARCH v2: Recursive Self-Improving ML Research System  [{engine.upper()}]")
     print("=" * width)
     print(f"  Project root : {PROJECT_ROOT}")
     print(f"  Branch       : {git_current_branch()}")
-    print(f"  Engine       : {_current_engine}")
+    print(f"  Engine       : {engine}")
     print(f"  Results dir  : {RESULTS_DIR}")
     print(f"  State file   : {STATE_FILE}")
     print(f"  TSV file     : {TSV_FILE}")
@@ -871,12 +737,12 @@ def print_progress(
     )
 
 
-def print_summary(state: RunState, baseline_bpb: Optional[float]) -> None:
+def print_summary(state: RunState, baseline_bpb: Optional[float], engine: str) -> None:
     """Print final run summary."""
     width = 70
     print()
     print("=" * width)
-    print(f"  RUN SUMMARY [{get_engine().upper()}]")
+    print(f"  RUN SUMMARY [{engine.upper()}]")
     print("=" * width)
     print(f"  Mode                 : {state.mode}")
     print(f"  Engine               : {state.engine}")
@@ -916,6 +782,8 @@ def main():
     global _interrupted, _current_engine
     signal.signal(signal.SIGINT, handle_interrupt)
     signal.signal(signal.SIGTERM, handle_interrupt)
+
+    _init_dirs()
 
     parser = argparse.ArgumentParser(
         description="Autoresearch v2: Recursive Self-Improving ML Research System",
@@ -989,7 +857,7 @@ def main():
     # Set the global engine context
     _current_engine = args.engine
 
-    print_banner()
+    print_banner(args.engine)
 
     # Determine experiment count
     mode_counts = {
@@ -1042,12 +910,11 @@ def main():
     if not queue:
         logger.info("No experiments remaining. Done!")
         state.start_time = state.start_time or datetime.now(timezone.utc).isoformat()
-        print_summary(state, None)
+        print_summary(state, None, args.engine)
         return
 
     # Run experiments
     baseline_bpb = None
-    train_file = PROJECT_ROOT / "train.py"
 
     # MLX: for baseline mode, just run train_mlx.py directly (no config changes)
     if args.mode == "baseline":
@@ -1073,10 +940,9 @@ def main():
         state.best_val_bpb = baseline_bpb
         state.best_experiment_id = "baseline_001"
         save_state(state)
-        print_summary(state, baseline_bpb)
+        print_summary(state, baseline_bpb, args.engine)
         return
 
-    # For non-baseline modes, we mutate the config and run experiments
     start_time = time.time()
 
     for idx, experiment in enumerate(queue):
@@ -1097,22 +963,23 @@ def main():
         logger.info(f"  Changes: {changes_str}")
         logger.info(f"  Hypothesis: {hypothesis}")
 
-        # Step 1: Apply changes (only for pytorch, or if target file exists)
+        config_path = None
         applied = None
         if changes:
-            applied = apply_changes_to_train(changes, engine=_current_engine)
-            if applied is None:
-                logger.error("Failed to apply changes, skipping experiment")
+            config_path = write_experiment_config(changes, exp_id, engine=_current_engine)
+            if config_path is None:
+                logger.error("Failed to write config, skipping experiment")
                 state.experiments_failed += 1
                 state.completed_ids.add(exp_id)
                 append_tsv(exp_id, category, None, None, args.phase, "failed", 0, changes_str,
-                           "Failed to apply changes", engine=_current_engine)
+                           "Failed to write config", engine=_current_engine)
                 save_state(state)
                 continue
+            applied = changes_str
 
         # Step 2: Run training
         logger.info(f"  Running {_current_engine} training (timeout: {args.timeout}s)...")
-        result = run_training(timeout=args.timeout, engine=_current_engine)
+        result = run_training(timeout=args.timeout, engine=_current_engine, config_path=config_path)
 
         # Step 3: Record result
         val_bpb = result["val_bpb"]
@@ -1204,9 +1071,6 @@ def main():
 
         # Save checkpoint
         save_state(state)
-
-        # Reset training script for next experiment
-        git_reset_train(_current_engine)
 
     # Final summary
     if _interrupted:

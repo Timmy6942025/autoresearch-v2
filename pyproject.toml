@@ -1,16 +1,12 @@
 [project]
 name = "autoresearch"
 version = "0.2.0"
-description = "Autonomous pretraining research system — MLX/Apple Silicon edition"
+description = "Autonomous multi-agent research engine — MLX/Apple Silicon edition"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # ─── Core: MLX for Apple Silicon GPU training ────────
     "mlx>=0.20.0",
-    # ─── TurboQuant-MLX: KV cache compression for eval ───
-    # 5.6× KV cache compression (92 bytes/tok vs 512 bytes fp16)
-    # Install from GitHub — not yet on PyPI
-    "turboquant-mlx",
     # ─── Data pipeline ───────────────────────────────────
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
@@ -20,12 +16,22 @@ dependencies = [
     # ─── Visualization & reporting ───────────────────────
     "matplotlib>=3.10.8",
     "requests>=2.32.0",
+    # ─── CLI & async ─────────────────────────────────────
+    "typer>=0.9.0",
+    "httpx>=0.27.0",
+    # ─── Web crawling ────────────────────────────────────
+    "beautifulsoup4>=4.12.0",
+    "duckduckgo-search>=6.0.0",
 ]
+
+[project.scripts]
+autoresearch = "autoresearch.cli.main:main"
 
 [[tool.uv.sources]]
 turboquant-mlx = { git = "https://github.com/sharpner/turboquant-mlx.git" }
 
 [project.optional-dependencies]
 # PyTorch kept for comparison/benchmarking only
-pytorch = ["torch==2.9.1", "kernels>=0.11.7"]
-dev     = ["pytest", "black", "mypy"]
+pytorch   = ["torch==2.9.1", "kernels>=0.11.7"]
+turboquant = ["turboquant-mlx"]
+dev       = ["pytest", "black", "mypy", "ruff"]

@@ -30,9 +30,9 @@ from mlx.utils import tree_flatten, tree_unflatten, tree_map
 # Import data pipeline
 # ---------------------------------------------------------------------------
 
-from prepare import (
+from shared_prepare import (
     MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS,
-    Tokenizer, make_dataloader, get_token_bytes,
+    Tokenizer, make_dataloader_numpy, get_token_bytes_numpy,
     CACHE_DIR, TOKENIZER_DIR,
 )
 
@@ -735,32 +735,7 @@ class TurboQuantKVCache(KVCache):
         return super().update_and_fetch(keys, values)
 
 
-# ---------------------------------------------------------------------------
-# MLX Data Loader
-# ---------------------------------------------------------------------------
 
-class MLXDataLoader:
-    """Wraps PyTorch-based make_dataloader to return MLX arrays.
-    
-    The PyTorch dataloader yields (torch.Tensor, torch.Tensor, epoch).
-    We convert to MLX arrays lazily.
-    """
-
-    def __init__(self, tokenizer, B, T, split, buffer_size=1000):
-        self._pytorch_loader = make_dataloader(tokenizer, B, T, split, buffer_size)
-        self._batch_size = B
-        self._seq_len = T
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        px, py, epoch = next(self._pytorch_loader)
-        # PyTorch tensor -> numpy -> MLX array (int32 for token indices)
-        import numpy as _np
-        x = mx.array(_np.asarray(px.cpu()), dtype=mx.int32)
-        y = mx.array(_np.asarray(py.cpu()), dtype=mx.int32)
-        return x, y, epoch
 
 
 # ---------------------------------------------------------------------------
@@ -769,15 +744,17 @@ class MLXDataLoader:
 
 def evaluate_bpb(model, tokenizer, batch_size, token_bytes_arr):
     """Bits per byte evaluation — MLX version."""
-    val_loader = MLXDataLoader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    val_loader = make_dataloader_numpy(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
 
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').reshape(-1)
-        y_flat = y.reshape(-1)
+        x_mx = mx.array(x, dtype=mx.int32)
+        y_mx = mx.array(y, dtype=mx.int32)
+        loss_flat = model(x_mx, y_mx, reduction='none').reshape(-1)
+        y_flat = y_mx.reshape(-1)
         nbytes = token_bytes_arr[y_flat]
         mask = nbytes > 0
         total_nats += float(mx.sum(loss_flat * mask))
@@ -932,11 +909,11 @@ def main():
     optimizer.init_grouped_params(model.trainable_parameters())
 
     # Datloader
-    train_loader = MLXDataLoader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+    train_loader = make_dataloader_numpy(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)
 
     # Token bytes for BPB
-    token_bytes_arr = get_token_bytes()
+    token_bytes_arr = get_token_bytes_numpy()
 
     print(f"Time budget: {TIME_BUDGET}s")
     print(f"Device batch size: {DEVICE_BATCH_SIZE}")
@@ -966,7 +943,9 @@ def main():
         last_loss_scalar = 0.0
 
         for micro_step in range(grad_accum_steps):
-            loss_val, grads = loss_and_grad_fn(x, y)
+            x_mx = mx.array(x, dtype=mx.int32)
+            y_mx = mx.array(y, dtype=mx.int32)
+            loss_val, grads = loss_and_grad_fn(x_mx, y_mx)
 
             # Normalize gradients by accumulation steps
             grads = tree_map(lambda g: g / grad_accum_steps, grads)
@@ -977,7 +956,7 @@ def main():
             else:
                 accumulated_grads = tree_map(mx.add, accumulated_grads, grads)
 
-            # Fetch next batch (MLX arrays)
+            # Fetch next batch (numpy arrays)
             x, y, epoch = next(train_loader)
             last_loss_scalar = float(loss_val)
 
