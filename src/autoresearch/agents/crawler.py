@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+from ipaddress import ip_address
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -12,6 +14,22 @@ import httpx
 from .base import Agent, Message, Tool, ToolResult
 
 logger = logging.getLogger("autoresearch.agents.crawler")
+
+
+def _is_safe_url(url: str) -> bool:
+    """Reject URLs pointing to private, loopback, or link-local addresses."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    try:
+        ip = ip_address(hostname)
+    except ValueError:
+        try:
+            ip = ip_address(socket.gethostbyname(hostname))
+        except (socket.gaierror, ValueError):
+            return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
 
 
 class WebCrawlerTool(Tool):
@@ -31,6 +49,11 @@ class WebCrawlerTool(Tool):
         max_concurrent: int = 5,
         timeout: int = 15,
     ) -> ToolResult:
+        safe_urls = [u for u in urls if _is_safe_url(u)]
+        blocked = [u for u in urls if not _is_safe_url(u)]
+        if blocked:
+            logger.warning("Blocked %d unsafe URLs: %s", len(blocked), blocked)
+
         results = []
         semaphore = asyncio.Semaphore(max_concurrent)
 

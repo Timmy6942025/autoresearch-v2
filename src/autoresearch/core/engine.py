@@ -155,8 +155,13 @@ class ResearchEngine:
         # Step 3b: Process local documents if provided
         document_content = []
         if files:
+            allowed_dir = Path.cwd().resolve()
             logger.info("Step 3b: Processing %d local documents", len(files))
             for file_path in files:
+                resolved = Path(file_path).resolve()
+                if not str(resolved).startswith(str(allowed_dir)):
+                    logger.warning("Blocked path traversal attempt: %s", file_path)
+                    continue
                 result = DocumentParser.parse(file_path)
                 if result.get("success"):
                     chunks = DocumentChunker.chunk(

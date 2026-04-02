@@ -141,26 +141,10 @@ class MLXBackend:
                                 v_compressed = self._kv_cache.compressor.compress(
                                     c.values
                                 )
+                                self._kv_cache.put(f"layer_{i}_k_{len(tokens)}", c.keys)
                                 self._kv_cache.put(
-                                    f"layer_{i}_k_{len(tokens)}", k_compressed
+                                    f"layer_{i}_v_{len(tokens)}", c.values
                                 )
-                                self._kv_cache.put(
-                                    f"layer_{i}_v_{len(tokens)}", v_compressed
-                                )
-                                c.keys = k_compressed
-                                c.values = v_compressed
-                                compressed_layers.add(i)
-                                v_compressed = self._kv_cache.compressor.compress(
-                                    c.values
-                                )
-                                self._kv_cache.put(
-                                    f"layer_{i}_k_{len(tokens)}", k_compressed
-                                )
-                                self._kv_cache.put(
-                                    f"layer_{i}_v_{len(tokens)}", v_compressed
-                                )
-                                c.keys = k_compressed
-                                c.values = v_compressed
                                 compressed_layers.add(i)
             else:
                 for token in generate_step(prompt_arr, self._model, sampler=sampler):

@@ -67,6 +67,7 @@ class ServerState:
         self.active_task: Optional[str] = None
         self.completed_count = 0
         self.state_manager = StateManager()
+        self._lock = asyncio.Lock()
 
 
 state = ServerState()
@@ -99,7 +100,7 @@ def create_app(enable_cors: bool = True) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
+            allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -119,13 +120,14 @@ async def post_research(req: ResearchRequest) -> ResearchResponse:
     if not state.engine:
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
-    if state.active_task:
-        raise HTTPException(
-            status_code=429, detail=f"Research already in progress: {state.active_task}"
-        )
-
-    research_id = str(uuid.uuid4())[:8]
-    state.active_task = research_id
+    async with state._lock:
+        if state.active_task:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Research already in progress: {state.active_task}",
+            )
+        research_id = str(uuid.uuid4())[:8]
+        state.active_task = research_id
 
     try:
         config = ResearchConfig()
@@ -158,7 +160,7 @@ async def post_research(req: ResearchRequest) -> ResearchResponse:
             id=research_id,
             status="failed",
             query=req.query,
-            error=str(e),
+            error="Research failed. Check server logs for details.",
         )
     finally:
         state.active_task = None
