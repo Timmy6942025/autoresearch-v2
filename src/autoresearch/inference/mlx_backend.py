@@ -120,6 +120,7 @@ class MLXBackend:
                 from mlx_lm.models.base import make_prompt_cache
 
                 cache = make_prompt_cache(self._model)
+                compressed_layers = set()
 
                 for token in generate_step(
                     prompt_arr, self._model, cache=cache, sampler=sampler
@@ -131,6 +132,8 @@ class MLXBackend:
 
                     if len(tokens) % 16 == 0:
                         for i, c in enumerate(cache):
+                            if i in compressed_layers:
+                                continue
                             if hasattr(c, "keys") and hasattr(c, "values"):
                                 k_compressed = self._kv_cache.compressor.compress(
                                     c.keys
@@ -144,6 +147,21 @@ class MLXBackend:
                                 self._kv_cache.put(
                                     f"layer_{i}_v_{len(tokens)}", v_compressed
                                 )
+                                c.keys = k_compressed
+                                c.values = v_compressed
+                                compressed_layers.add(i)
+                                v_compressed = self._kv_cache.compressor.compress(
+                                    c.values
+                                )
+                                self._kv_cache.put(
+                                    f"layer_{i}_k_{len(tokens)}", k_compressed
+                                )
+                                self._kv_cache.put(
+                                    f"layer_{i}_v_{len(tokens)}", v_compressed
+                                )
+                                c.keys = k_compressed
+                                c.values = v_compressed
+                                compressed_layers.add(i)
             else:
                 for token in generate_step(prompt_arr, self._model, sampler=sampler):
                     token_val = token[0] if isinstance(token, tuple) else token
